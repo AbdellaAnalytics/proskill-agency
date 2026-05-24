@@ -1,6 +1,5 @@
-
 // ═══════════════════════════════════════════════════════════════════
-// /api/adobe-sheet.js — Vercel Serverless Function
+// /api/adobe-sheet.js — Vercel Serverless Function (ES Module)
 // Reads ProSkill's Adobe Google Sheet using a service account.
 // The private key NEVER reaches the browser; it lives only in Vercel
 // environment variables.
@@ -12,7 +11,7 @@
 //   GOOGLE_SHEET_RANGE      — e.g. "A:N" or "Copy of adobe Edu!A:N"
 // ═══════════════════════════════════════════════════════════════════
 
-const crypto = require("crypto");
+import crypto from "node:crypto";
 
 // Base64-url encode (no padding, +→-, /→_)
 function b64url(buf) {
@@ -132,7 +131,7 @@ function transformRows(values) {
     .filter(r => r.email); // ignore blank rows
 }
 
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   // Allow only GET; respond to CORS preflight
   if (req.method === "OPTIONS") {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -184,4 +183,4 @@ module.exports = async (req, res) => {
       error: err && err.message ? err.message : "Unknown error",
     });
   }
-};
+}
