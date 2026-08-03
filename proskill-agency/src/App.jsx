@@ -1680,6 +1680,15 @@ export default function App() {
   // A sale is "open" when it's delivered, not refunded, and still owes money.
   const isOpenSale = (s) => !!s && s.done && !s.refunded && getRemainingAmount(s) > 0;
 
+  // Vendor suggestions, pooled from everywhere a supplier name already exists.
+  // Memoised: the datalists render inside modals, and rebuilding this from the
+  // whole sales array on every keystroke would be wasteful.
+  const vendorOptions = useMemo(() => [...new Set([
+    ...suppliers.map(s => s.supplier),
+    ...adobeAccounts.map(a => a.source),
+    ...sales.map(s => s.vendor),
+  ].filter(Boolean))].sort(), [suppliers, adobeAccounts, sales]);
+
   // ─── Stock linking ───
   // NOTE: there is deliberately no shared "findAvailableAccount" helper. Allocating
   // stock inside a loop must use a local claim set (see claimStock in addSale /
@@ -1782,6 +1791,7 @@ export default function App() {
         costPrice: L.costPrice || 0,
         currency: L.currency || "EGP",
         notes: newSale.notes || "",
+        vendor: (newSale.vendor || "").trim() || null,
         soldDate,
         done: false,
         followUp: false,
@@ -2372,12 +2382,13 @@ export default function App() {
         // qty × unit_price = line total (qty defaults to 1)
         const qty = Number(it.qty) > 0 ? Number(it.qty) : 1;
         const unit = Number(it.unit_price) || 0;
+        const unitCost = Number(it.cost_price) || 0;
         return {
           service: serviceName,
           // period is editable in review; default 1 month if not set
           period: it.period_months != null ? Number(it.period_months) : 1,
           price: qty * unit,
-          costPrice: 0,
+          costPrice: qty * unitCost,
           currency: it.currency || f.totals?.currency || "EGP",
         };
       });
@@ -2431,12 +2442,18 @@ export default function App() {
           price: L.price,
           costPrice: L.costPrice || 0,
           currency,
-          notes: "🧾 Created from intake #" + intake.id,
+          notes: (f.notes || "").trim()
+            ? f.notes.trim() + "\n(intake #" + intake.id + ")"
+            : "🧾 Created from intake #" + intake.id,
+          vendor: (f.vendor || "").trim() || null,
           soldDate,
           done: true, // approved intake → sale done
           followUp: false,
           renewDate: rD,
-          checklist: checklist.map(c => ({ label: c, checked: false })),
+          // Intake records a transaction that already happened, so the checklist
+          // defaults to fully done. Turn the toggle off in review if the sale
+          // hasn't actually been delivered yet.
+          checklist: checklist.map(c => ({ label: c, checked: f.checklistDone !== false })),
           soldBy: cU ? cU.name : "?",
           assignedTo: isAdmin ? null : memberId, // matches addSale auto-assign
           createdDate: todayStr(),
@@ -4377,6 +4394,7 @@ export default function App() {
                 <div><strong>Customer:</strong> {selSale.customer}</div>
                 {selSale.customerPhone && <div><strong>Phone:</strong> {selSale.customerPhone}</div>}
                 {selSale.customerEmail && <div><strong>Email:</strong> {selSale.customerEmail}</div>}
+                {selSale.vendor && <div><strong>🏪 Vendor:</strong> {selSale.vendor}</div>}
 
                 {/* Adobe Tracker linked rental info */}
                 {selSale.service === "Adobe" && selSale.adobeAccountId && (() => {
@@ -4586,7 +4604,39 @@ export default function App() {
 
               {/* Checklist */}
               <div style={{ marginBottom: 14 }}>
-                <div style={{ fontSize: t.fs.md, fontWeight: 700, marginBottom: 8 }}>✅ Checklist</div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, gap: 8 }}>
+                  <div style={{ fontSize: t.fs.md, fontWeight: 700 }}>
+                    ✅ Checklist
+                    {(selSale.checklist || []).length > 0 && (
+                      <span style={{ fontSize: t.fs.xs, color: t.textMuted, fontWeight: 400, marginLeft: 6 }}>
+                        {(selSale.checklist || []).filter(c => c.checked).length}/{(selSale.checklist || []).length}
+                      </span>
+                    )}
+                  </div>
+                  {canEditSale(selSale) && (selSale.checklist || []).length > 0 && (() => {
+                    const allDone = (selSale.checklist || []).every(c => c.checked);
+                    return (
+                      <button
+                        onClick={() => {
+                          if (!canEditSale(selSale)) return;
+                          const target = !allDone;
+                          // Mirror updateChecklist's logging, but outside the state
+                          // updater — updaters must stay free of side effects.
+                          const paymentItem = (selSale.checklist || [])
+                            .find(c => (c.label || "").toLowerCase().includes("payment"));
+                          if (target && paymentItem && !paymentItem.checked) {
+                            addLog("💳 Payment confirmed: " + selSale.customer);
+                          }
+                          setSales(p => p.map(s => s.id === selSale.id
+                            ? { ...s, checklist: (s.checklist || []).map(c => ({ ...c, checked: target })) }
+                            : s));
+                          setSelSale(p => ({ ...p, checklist: (p.checklist || []).map(c => ({ ...c, checked: target })) }));
+                        }}
+                        style={{ ...t.btnGhost, padding: "4px 12px", fontSize: t.fs.xs, minHeight: 30 }}
+                      >{allDone ? "☐ Untick all" : "☑ Tick all"}</button>
+                    );
+                  })()}
+                </div>
                 {(selSale.checklist || []).map((c, i) => (
                   <label
                     key={i}
@@ -4734,6 +4784,19 @@ export default function App() {
                   <label style={t.label}>Sold Date</label>
                   <input type="date" value={editSale.soldDate || ""} onChange={e => setEditSale(p => ({ ...p, soldDate: e.target.value }))} style={t.input} />
                 </div>
+              </div>
+              <div style={{ marginBottom: 12 }}>
+                <label style={t.label}>🏪 Vendor / Supplier</label>
+                <input
+                  value={editSale.vendor || ""}
+                  onChange={e => setEditSale(p => ({ ...p, vendor: e.target.value }))}
+                  placeholder="Who you bought it from"
+                  style={t.input}
+                  list="vendor-picker-edit"
+                />
+                <datalist id="vendor-picker-edit">
+                  {vendorOptions.map(v => <option key={v} value={v} />)}
+                </datalist>
               </div>
               <div style={{ marginBottom: 12 }}>
                 <label style={t.label}>Notes</label>
@@ -4941,7 +5004,7 @@ export default function App() {
                               <option value="">— Match to product —</option>
                               {svcNames.map(s => <option key={s} value={"svc_" + s}>{s}</option>)}
                             </select>
-                            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginTop: 6 }}>
+                            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6, marginTop: 6 }}>
                               <div>
                                 <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>Qty</div>
                                 <input
@@ -4971,6 +5034,20 @@ export default function App() {
                                 />
                               </div>
                               <div>
+                                <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>💸 Your cost</div>
+                                <input
+                                  type="number"
+                                  placeholder="Cost"
+                                  value={item.cost_price ?? ""}
+                                  onChange={e => {
+                                    const items = [...(f.items || [])];
+                                    items[idx] = { ...item, cost_price: Number(e.target.value) || 0 };
+                                    updateIntakeField(it.id, { items });
+                                  }}
+                                  style={t.input}
+                                />
+                              </div>
+                              <div>
                                 <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>Period *</div>
                                 <select
                                   value={item.period_months ?? ""}
@@ -4992,9 +5069,25 @@ export default function App() {
                                 </select>
                               </div>
                             </div>
-                            <div style={{ fontSize: t.fs.xs, color: t.primary, marginTop: 4, fontWeight: 700 }}>
-                              Line total: {((Number(item.qty) > 0 ? Number(item.qty) : 1) * (Number(item.unit_price) || 0)).toLocaleString()} {item.currency || f.totals?.currency || "EGP"}
-                            </div>
+                            {(() => {
+                              const q = Number(item.qty) > 0 ? Number(item.qty) : 1;
+                              const lineTotal = q * (Number(item.unit_price) || 0);
+                              const lineCost = q * (Number(item.cost_price) || 0);
+                              const profit = lineTotal - lineCost;
+                              const cur = item.currency || f.totals?.currency || "EGP";
+                              return (
+                                <div style={{ fontSize: t.fs.xs, marginTop: 4, fontWeight: 700 }}>
+                                  <span style={{ color: t.primary }}>Total: {lineTotal.toLocaleString()} {cur}</span>
+                                  <span style={{ color: t.textMuted }}> · cost {lineCost.toLocaleString()} · </span>
+                                  <span style={{ color: profit >= 0 ? t.success : t.danger }}>
+                                    profit {profit.toLocaleString()}
+                                  </span>
+                                  {lineCost === 0 && lineTotal > 0 && (
+                                    <span style={{ color: t.warning }}> ⚠️ cost not set</span>
+                                  )}
+                                </div>
+                              );
+                            })()}
                           </div>
                         ))}
                         {/* Items sum vs stated total mismatch warning */}
@@ -5099,6 +5192,55 @@ export default function App() {
                         </select>
                       </div>
                     </div>
+
+                    {/* Vendor + notes — manual, the model can't know these */}
+                    <div style={{ marginBottom: 12 }}>
+                      <label style={t.label}>🏪 Vendor / Supplier</label>
+                      <input
+                        value={f.vendor || ""}
+                        onChange={e => updateIntakeField(it.id, { vendor: e.target.value })}
+                        placeholder="Who you bought it from"
+                        style={t.input}
+                        list="vendor-picker"
+                      />
+                      <datalist id="vendor-picker">
+                        {vendorOptions.map(v => <option key={v} value={v} />)}
+                      </datalist>
+                    </div>
+
+                    <div style={{ marginBottom: 12 }}>
+                      <label style={t.label}>📝 Notes</label>
+                      <textarea
+                        value={f.notes ?? ""}
+                        onChange={e => updateIntakeField(it.id, { notes: e.target.value })}
+                        placeholder="Anything to record on the sale"
+                        rows={2}
+                        style={{ ...t.input, fontFamily: "inherit", resize: "vertical" }}
+                      />
+                    </div>
+
+                    {/* Checklist auto-complete */}
+                    <label style={{
+                      display: "flex", alignItems: "center", gap: 10, marginBottom: 12,
+                      padding: 10, borderRadius: 8, cursor: "pointer",
+                      background: f.checklistDone !== false ? (t.dark ? "#052e16" : "#f0fdf4") : t.cardBg2,
+                      border: "1px solid " + (f.checklistDone !== false ? t.success : t.border),
+                    }}>
+                      <input
+                        type="checkbox"
+                        checked={f.checklistDone !== false}
+                        onChange={e => updateIntakeField(it.id, { checklistDone: e.target.checked })}
+                        style={{ width: 20, height: 20, accentColor: t.success }}
+                      />
+                      <div>
+                        <strong style={{ fontSize: t.fs.sm }}>✅ Mark the whole checklist as done</strong>
+                        <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>
+                          {f.checklistDone !== false
+                            ? "All " + checklist.length + " steps will be ticked — this sale already happened"
+                            : "Steps stay unticked — tick them yourself as you deliver"}
+                        </div>
+                      </div>
+                    </label>
 
                     {/* Metadata */}
                     <div style={{ ...t.card, padding: 8, marginBottom: 14, fontSize: t.fs.xs, color: t.textMuted }}>
@@ -6353,6 +6495,7 @@ export default function App() {
                     Customer: a.customer,
                     Phone: a.customerPhone || "",
                     Email: a.customerEmail || "",
+                    Vendor: a.vendor || "",
                     Price: a.price,
                     Currency: a.currency || "EGP",
                     "Sold Date": a.soldDate,
@@ -6363,6 +6506,7 @@ export default function App() {
                   onXlsx={() => exportExcel(filteredSales.map(a => ({
                     Service: a.service, Customer: a.customer, Phone: a.customerPhone || "",
                     Email: a.customerEmail || "",
+                    Vendor: a.vendor || "",
                     Price: a.price, Currency: a.currency || "EGP",
                     SoldDate: a.soldDate, RenewDate: a.renewDate,
                     Status: a.done ? "Done" : "Pending",
@@ -6673,6 +6817,19 @@ export default function App() {
                       </select>
                     </div>
                   )}
+                </div>
+                <div style={{ marginBottom: 10 }}>
+                  <label style={t.label}>🏪 Vendor / Supplier (optional)</label>
+                  <input
+                    value={newSale.vendor || ""}
+                    onChange={e => setNewSale(p => ({ ...p, vendor: e.target.value }))}
+                    placeholder="Who you bought it from"
+                    style={t.input}
+                    list="vendor-picker-manual"
+                  />
+                  <datalist id="vendor-picker-manual">
+                    {vendorOptions.map(v => <option key={v} value={v} />)}
+                  </datalist>
                 </div>
                 <div style={{ marginBottom: 10 }}>
                   <label style={t.label}>Notes (shared across all services)</label>
