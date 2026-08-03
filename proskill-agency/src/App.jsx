@@ -44,6 +44,51 @@ const sb = {
       return { ok: false, status: 0, data: { error: e.message } };
     }
   },
+
+  // ═══ Storage: intake images ═══
+  // Files are private. Reads go through short-lived signed URLs, never public links.
+  STORAGE_BUCKET: "sale-intake",
+  async uploadFile(path, file) {
+    if (!this.token) return { ok: false, error: "Not signed in" };
+    try {
+      const ctrl = new AbortController();
+      const timeoutId = setTimeout(() => ctrl.abort(), 60000);
+      const res = await fetch(
+        SUPABASE_URL + "/storage/v1/object/" + this.STORAGE_BUCKET + "/" + path,
+        {
+          method: "POST",
+          headers: {
+            apikey: SUPABASE_KEY,
+            Authorization: "Bearer " + this.token,
+            "x-upsert": "true",
+            ...(file.type ? { "Content-Type": file.type } : {}),
+          },
+          body: file,
+          signal: ctrl.signal,
+        }
+      );
+      clearTimeout(timeoutId);
+      const text = await res.text();
+      if (!res.ok) return { ok: false, error: "HTTP " + res.status + ": " + text.slice(0, 200) };
+      return { ok: true, path };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  },
+  async signedUrl(path, expiresIn = 3600) {
+    if (!this.token) return { ok: false, error: "Not signed in" };
+    const r = await this.req(
+      "/storage/v1/object/sign/" + this.STORAGE_BUCKET + "/" + path,
+      { method: "POST", body: JSON.stringify({ expiresIn }) }
+    );
+    // Different Supabase versions spell this signedURL / signedUrl
+    const rel = r.data && (r.data.signedURL || r.data.signedUrl);
+    if (!r.ok || !rel) {
+      return { ok: false, error: (r.data && (r.data.error || r.data.message)) || ("HTTP " + r.status) };
+    }
+    // Comes back relative, e.g. "/object/sign/bucket/path?token=..."
+    return { ok: true, url: rel.startsWith("http") ? rel : SUPABASE_URL + "/storage/v1" + rel };
+  },
   async signUp(email, password) {
     const r = await this.req("/auth/v1/signup", { method: "POST", body: JSON.stringify({ email, password }) });
     if (r.ok && r.data && r.data.access_token) {
@@ -129,13 +174,8 @@ const sb = {
         if (s && s.paymentProof && s.paymentProof.data && s.paymentProof.data.length > 1000) {
           return {
             ...s,
-            paymentProof: {
-              name: s.paymentProof.name,
-              type: s.paymentProof.type,
-              size: s.paymentProof.size,
-              data: null, // Stripped for cloud. Kept locally in localStorage.
-              _stripped: true,
-            },
+            // Spread, don't whitelist: a whitelist silently drops any field added later.
+            paymentProof: { ...s.paymentProof, data: null, _stripped: true },
           };
         }
         return s;
@@ -147,16 +187,25 @@ const sb = {
         if (r && r.attachment && r.attachment.data && r.attachment.data.length > 1000) {
           return {
             ...r,
-            attachment: {
-              name: r.attachment.name,
-              type: r.attachment.type,
-              size: r.attachment.size,
-              data: null,
-              _stripped: true,
-            },
+            attachment: { ...r.attachment, data: null, _stripped: true },
           };
         }
         return r;
+      });
+    }
+    // Sale intakes: drop inline base64 from legacy records. Everything else —
+    // above all storagePath — must survive, or the images become unreachable on
+    // every other device.
+    if (Array.isArray(data.saleIntakes)) {
+      slim.saleIntakes = data.saleIntakes.map(intake => {
+        if (!intake || !Array.isArray(intake.images)) return intake;
+        if (!intake.images.some(img => img && img.base64)) return intake; // nothing to strip
+        return {
+          ...intake,
+          images: intake.images.map(img => (
+            img && img.base64 ? { ...img, base64: null, _stripped: true } : img
+          )),
+        };
       });
     }
     return slim;
@@ -333,6 +382,7 @@ const MEMBER_TABS = [
   { id: "stock",       label: "📦 Stock",           defaultOn: true  },
   { id: "adobe",       label: "🎨 Adobe",           defaultOn: true  },
   { id: "adobeTracker",label: "🎯 Adobe Tracker",   defaultOn: false },
+  { id: "saleIntake",  label: "🧾 Sale Intake",      defaultOn: false },
   { id: "renewals",    label: "🔄 Renewals",        defaultOn: true  },
   { id: "suppliers",   label: "🏪 Suppliers",       defaultOn: false },
   { id: "watemplates", label: "💬 WA Templates",    defaultOn: true  },
@@ -355,6 +405,7 @@ const PERM_ACTIONS = [
   { id: "canRefund",       label: "↩️ Issue refunds",                  defaultOn: false },
   { id: "manageSuppliers", label: "🏪 Manage suppliers (debit/credit)", defaultOn: false },
   { id: "adobeTracker",    label: "🎯 Adobe Tracker (accounts/rentals)", defaultOn: false },
+  { id: "saleIntake",      label: "🧾 Sale Intake (AI extraction)",     defaultOn: false },
   { id: "viewCommissionAll", label: "💰 See all team's commissions",   defaultOn: false },
 ];
 const DEFAULT_MEMBER_ACTIONS = PERM_ACTIONS.reduce((o, a) => { o[a.id] = a.defaultOn; return o; }, {});
@@ -553,6 +604,15 @@ function isAfterDate(a, b) {
   // returns true if a > b (both YYYY-MM-DD or Date)
   if (!a || !b) return false;
   return new Date(a).getTime() > new Date(b).getTime();
+}
+// Is this rental currently running? SINGLE SOURCE OF TRUTH.
+// status alone is not enough: status is stamped at creation and never updated,
+// so an "active" rental whose end date has passed must not count as running —
+// otherwise it shows in BOTH the Active and History lists.
+function isRentalRunning(r) {
+  if (!r || r.status !== "active") return false;
+  const d = getCustomerDaysLeft(r);
+  return d == null ? false : d >= 0;
 }
 // Get the customer's actual days remaining.
 // Prefer the imported value (col M) from Excel if it exists and we haven't drifted too far.
@@ -774,12 +834,14 @@ function AdobeImportModal({ theme, isMobile, onClose, onImport }) {
 
   const toDateStr = (cell) => {
     if (cell == null || cell === "") return null;
-    if (cell instanceof Date) return cell.toISOString().slice(0, 10);
+    // A date cell has no time-of-day meaning — read the calendar date the user
+    // sees. toISOString() would convert to UTC and shift back a day in UTC+X.
+    if (cell instanceof Date) return isNaN(cell.getTime()) ? null : dateToStr(cell);
     if (typeof cell === "number") return serialToDate(cell);
     const s = String(cell).trim();
     if (!s) return null;
     const d = new Date(s);
-    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+    if (!isNaN(d.getTime())) return dateToStr(d);
     return null;
   };
 
@@ -1071,6 +1133,19 @@ export default function App() {
   const [showAdobeImport, setShowAdobeImport] = useState(false);
   // Partial payment modal
   const [partialPayModal, setPartialPayModal] = useState(null);
+  // ─── Sale Intake (Gemini AI extraction from WhatsApp screenshots) ───
+  const [saleIntakes, setSaleIntakes] = useState([]); // Array of intake objects
+  const [intakeSubTab, setIntakeSubTab] = useState("new"); // new | pending | history
+  const [intakeMode, setIntakeMode] = useState("new_sale"); // new_sale | payment_on_existing
+  const [intakeImages, setIntakeImages] = useState([]); // [{name, mimeType, base64, sha256}]
+  const [intakeChat, setIntakeChat] = useState("");
+  const [intakeAnalyzing, setIntakeAnalyzing] = useState(false);
+  const [intakeError, setIntakeError] = useState("");
+  const [reviewIntake, setReviewIntake] = useState(null);
+  const approvingRef = useRef(false);
+  // Signed URLs for intake images, keyed by storage path. Links are short-lived,
+  // so they are fetched on demand when a review opens rather than stored.
+  const [intakeImageUrls, setIntakeImageUrls] = useState({});
   const [newTask, setNewTask] = useState(null);
   const [editTask, setEditTask] = useState(null);
   const [newBundle, setNewBundle] = useState(null);
@@ -1263,6 +1338,7 @@ export default function App() {
     if (d.suppliers) setSuppliers(d.suppliers);
     if (d.adobeAccounts) setAdobeAccounts(d.adobeAccounts);
     if (d.adobeRentals) setAdobeRentals(d.adobeRentals);
+    if (d.saleIntakes) setSaleIntakes(d.saleIntakes);
   };
 
   // ═══ AUTO-SAVE (with queue, retry, local backup) ═══
@@ -1272,7 +1348,7 @@ export default function App() {
     const dataToSave = {
       services, sales, sConf, stockRows, guides, checklist, customers, logs,
       dark, comments, expenses, tasks, bundles, feedback, waTemplates, team,
-      dismissedN, seenN, suppliers, adobeAccounts, adobeRentals,
+      dismissedN, seenN, suppliers, adobeAccounts, adobeRentals, saleIntakes,
     };
 
     // 1. ALWAYS write to localStorage immediately so data is never lost
@@ -1328,7 +1404,7 @@ export default function App() {
   }, [
     services, sales, sConf, stockRows, guides, checklist, customers, logs,
     dark, comments, expenses, tasks, bundles, feedback, waTemplates, team,
-    dismissedN, seenN, suppliers, adobeAccounts, adobeRentals,
+    dismissedN, seenN, suppliers, adobeAccounts, adobeRentals, saleIntakes,
     loaded, authStatus, workspaceOwnerId,
   ]);
 
@@ -1586,8 +1662,29 @@ export default function App() {
     addLog("Deleted service: " + n);
   };
 
+  // ─── Money on a sale: SINGLE SOURCE OF TRUTH ───
+  // Every screen must use these. Computing paid inline misses legacy sales that
+  // were settled through the old proof-approval flow (proofStatus "approved"
+  // with no partialPayments) — those would wrongly appear as still owing.
+  const getPaidAmount = (sale) => {
+    if (!sale) return 0;
+    const partials = sale.partialPayments || [];
+    if (partials.length > 0) return partials.reduce((s, p) => s + (p.amount || 0), 0);
+    if (sale.proofStatus === "approved") return sale.price || 0;
+    return 0;
+  };
+  const getRemainingAmount = (sale) => {
+    if (!sale) return 0;
+    return Math.max(0, (sale.price || 0) - getPaidAmount(sale));
+  };
+  // A sale is "open" when it's delivered, not refunded, and still owes money.
+  const isOpenSale = (s) => !!s && s.done && !s.refunded && getRemainingAmount(s) > 0;
+
   // ─── Stock linking ───
-  const findAvailableAccount = (product) => stockRows.find(r => r.product === product && !r.sold);
+  // NOTE: there is deliberately no shared "findAvailableAccount" helper. Allocating
+  // stock inside a loop must use a local claim set (see claimStock in addSale /
+  // approveIntake), because stockRows state does not update between iterations —
+  // a plain lookup hands the same account to two lines of the same service.
   const unlinkStockFromSale = (saleId) => {
     const sale = sales.find(s => s.id === saleId);
     if (!sale || !sale.linkedStockId) return;
@@ -1658,13 +1755,21 @@ export default function App() {
     // Shared transaction ID so renewing one can hint at related ones
     const transactionId = Date.now();
     const created = [];
+    // stockRows state does not update mid-loop, so two lines of the same service
+    // would otherwise both be handed the same account. Track claims locally.
+    const claimedStockIds = new Set();
+    const claimStock = (product) => {
+      const row = stockRows.find(r => r.product === product && !r.sold && !claimedStockIds.has(r.id));
+      if (row) claimedStockIds.add(row.id);
+      return row;
+    };
     lines.forEach((L, idx) => {
       const rD = L.period > 0
         ? addMonths(soldDate, L.period)
         : L.period === -1 ? "2099-12-31" : soldDate;
       const pe = toEgp(L.price, L.currency || "EGP");
       const ce = toEgp(L.costPrice || 0, L.currency || "EGP");
-      const available = findAvailableAccount(L.service);
+      const available = claimStock(L.service);
       const saleId = transactionId + idx; // unique per line
       const entry = {
         id: saleId,
@@ -1904,6 +2009,23 @@ export default function App() {
       refundedBy: cU ? cU.name : "?",
       refundedAt: new Date().toISOString(),
     } : s));
+    // A FULL refund ends the service, so any Adobe account tied to this sale must
+    // go back to the pool — otherwise it stays locked to a refunded customer forever.
+    // A partial refund leaves the subscription running, so the rental stays open.
+    if (!isPartial) {
+      let released = 0;
+      setAdobeRentals(p => p.map(r => {
+        if (r.saleId !== saleId || r.status !== "active") return r;
+        released++;
+        return {
+          ...r,
+          status: "completed",
+          closedByRefund: true,
+          closedAt: new Date().toISOString(),
+        };
+      }));
+      if (released > 0) addLog("🎯 Adobe account released back to inventory (refund): " + sale.customer);
+    }
     addLog("↩️ Refund " + (isPartial ? "(partial " + amt + ")" : "(full)") + ": " + sale.customer + " · " + sale.service);
   };
 
@@ -1921,6 +2043,13 @@ export default function App() {
       refundedBy: null,
       refundedAt: null,
     } : s));
+    // Reopen only rentals that THIS refund closed — never touch ones that were
+    // completed for other reasons (period ended, manually closed).
+    setAdobeRentals(p => p.map(r => {
+      if (r.saleId !== saleId || !r.closedByRefund) return r;
+      const { closedByRefund, closedAt, ...rest } = r;
+      return { ...rest, status: "active" };
+    }));
     addLog("↩️ Refund cancelled: " + sale.customer + " · " + sale.service);
   };
 
@@ -1981,6 +2110,512 @@ export default function App() {
   };
 
   // ═══════════════════════════════════════════════════════════════════
+  // 🧾 SALE INTAKE HELPERS (Gemini AI extraction)
+  // ═══════════════════════════════════════════════════════════════════
+  // Compute SHA-256 hash of image (base64) for dedup
+  // SHA-256 of the raw file bytes. Hashing the File directly avoids a second
+  // multi-megabyte pass over a base64 string.
+  const hashFile = async (file) => {
+    try {
+      if (!crypto || !crypto.subtle) return null; // needs a secure context
+      const buf = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+      return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+    } catch (e) {
+      console.error("[Intake] hash error:", e);
+      return null;
+    }
+  };
+  // Read file → base64 string (without data:...;base64, prefix)
+  const fileToBase64 = (file) => new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      const s = r.result;
+      const idx = s.indexOf(",");
+      resolve(idx >= 0 ? s.slice(idx + 1) : s);
+    };
+    r.onerror = () => reject(new Error("Read failed"));
+    r.readAsDataURL(file);
+  });
+  // Fallback only: used if the original File reference is somehow unavailable.
+  const base64ToBlobFallback = (base64, mimeType) => {
+    try {
+      const bin = atob(base64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return new Blob([bytes], { type: mimeType || "application/octet-stream" });
+    } catch (e) {
+      console.error("[Intake] base64→blob failed:", e);
+      return null;
+    }
+  };
+  // Add uploaded image to intake staging area
+  const addIntakeImage = async (file) => {
+    if (!file) return;
+    if (file.size > 4 * 1024 * 1024) { alert("Max image size: 4 MB (Gemini limit)"); return; }
+    if (intakeImages.length >= 8) { alert("Max 8 images per intake"); return; }
+    const base64 = await fileToBase64(file);
+    const sha256 = await hashFile(file);
+    // A null hash means hashing was unavailable — it must NOT be treated as a
+    // value that matches other nulls, or the second image gets rejected as a dupe.
+    if (sha256) {
+      if (intakeImages.some(im => im.sha256 === sha256)) {
+        alert("This image is already added (duplicate detected)");
+        return;
+      }
+      const dupIntake = saleIntakes.find(it => (it.images || []).some(im => im.sha256 === sha256));
+      if (dupIntake) {
+        if (!confirm("⚠️ This exact image was used before in intake #" + dupIntake.id + " (" + dupIntake.status + "). Add anyway?")) return;
+      }
+    }
+    setIntakeImages(p => [...p, {
+      name: file.name,
+      mimeType: file.type || "image/jpeg",
+      size: file.size,
+      base64,   // for Gemini only — never persisted
+      file,     // uploaded to Storage as-is
+      sha256,
+    }]);
+  };
+  const removeIntakeImage = (idx) => {
+    setIntakeImages(p => p.filter((_, i) => i !== idx));
+  };
+  // Build the catalog payload the Edge Function will send to Gemini
+  const buildIntakeCatalog = () => {
+    // Products = current services with pricing hints
+    const products = services.map(s => ({
+      id: "svc_" + s.name,
+      name: s.name,
+      price: s.priceEGP || s.price,
+      currency: "EGP",
+    }));
+    // Recent customers (last 200 by activity)
+    const custList = customers.slice(0, 200).map(c => ({
+      id: "cust_" + c.id,
+      name: c.name,
+      phone: c.phone || null,
+    }));
+    // Open sales = delivered, not refunded, still owing money
+    const openSales = sales.filter(isOpenSale).slice(0, 100).map(s => {
+      const paid = getPaidAmount(s);
+      return {
+        id: "sale_" + s.id,
+        customer: s.customer,
+        service: s.service,
+        total: s.price || 0,
+        paid,
+        remaining: getRemainingAmount(s),
+        currency: s.currency || "EGP",
+        date: s.soldDate || s.createdDate,
+      };
+    });
+    return { products, customers: custList, open_sales: openSales };
+  };
+  // Call Supabase Edge Function
+  const analyzeIntake = async () => {
+    if (intakeImages.length === 0) { alert("Upload at least one image"); return; }
+    if (!currentUser) { alert("Not signed in"); return; }
+    setIntakeAnalyzing(true);
+    setIntakeError("");
+    try {
+      const catalog = buildIntakeCatalog();
+      const supabaseUrl = window.location.hostname === "localhost"
+        ? "https://jsemibrimkacjbbsdozm.supabase.co"
+        : "https://jsemibrimkacjbbsdozm.supabase.co";
+      const url = supabaseUrl + "/functions/v1/gemini-intake";
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + (sb.token || SUPABASE_KEY),
+        },
+        body: JSON.stringify({
+          images: intakeImages.map(im => ({ mimeType: im.mimeType, data: im.base64 })),
+          chat: intakeChat,
+          catalog,
+        }),
+      });
+      const json = await resp.json();
+      if (!resp.ok || !json.ok) {
+        throw new Error(json.error || ("HTTP " + resp.status));
+      }
+      const intakeId = Date.now();
+      // Upload images to private Storage. base64 stays in memory only — it is far
+      // too large for the workspace JSON and would stall every sync.
+      // Scope files by workspace owner so RLS can key off the folder name.
+      const ownerScope = (() => {
+        try { return localStorage.getItem("ps_admin_id") || (currentUser && currentUser.id) || "unknown"; }
+        catch { return (currentUser && currentUser.id) || "unknown"; }
+      })();
+      const storedImages = await Promise.all(intakeImages.map(async (im, i) => {
+        const ext = (im.name.split(".").pop() || "jpg").toLowerCase().replace(/[^a-z0-9]/g, "");
+        const path = ownerScope + "/" + intakeId + "/" + i + "-" + (im.sha256 || "x").slice(0, 8) + "." + ext;
+        const blob = im.file || base64ToBlobFallback(im.base64, im.mimeType);
+        const up = blob ? await sb.uploadFile(path, blob) : { ok: false, error: "no file data" };
+        return {
+          name: im.name,
+          mimeType: im.mimeType,
+          size: im.size,
+          sha256: im.sha256,
+          storagePath: up.ok ? path : null,
+          uploadError: up.ok ? null : (up.error || "upload failed"),
+        };
+      }));
+      const uploadFailures = storedImages.filter(im => !im.storagePath).length;
+      if (uploadFailures > 0) {
+        console.warn("[Intake] " + uploadFailures + " image(s) failed to upload to Storage");
+      }
+      // Save the intake as pending
+      const intake = {
+        id: intakeId,
+        status: "pending",
+        mode: intakeMode,
+        images: storedImages,
+        chat: intakeChat,
+        extracted: json.extracted, // raw AI output
+        fields: JSON.parse(JSON.stringify(json.extracted)), // editable copy
+        model: json.model,
+        tokensIn: json.tokens_in,
+        tokensOut: json.tokens_out,
+        thoughtsTokens: json.thoughts_tokens || 0,
+        createdBy: cU ? cU.name : "?",
+        createdAt: new Date().toISOString(),
+        manualEdits: {}, // { fieldPath: reason }
+      };
+      setSaleIntakes(p => [intake, ...p]);
+      // Clear staging
+      setIntakeImages([]);
+      setIntakeChat("");
+      // Open review
+      setReviewIntake(intake);
+      addLog("🧾 Intake analyzed by AI (" + json.tokens_in + "→" + json.tokens_out + " tokens)"
+        + (uploadFailures ? " · ⚠️ " + uploadFailures + " image upload(s) failed" : ""));
+    } catch (e) {
+      console.error("[Intake] analyze error:", e);
+      setIntakeError(e.message || "Unknown error");
+    }
+    setIntakeAnalyzing(false);
+  };
+  // Approve intake → create sale/payment via normal path
+  const approveIntake = (intake) => {
+    if (!isAdmin && !can("saleIntake")) { alert("Permission denied"); return; }
+    // Re-entrancy guard. A ref (not state) because a second click can fire
+    // before React re-renders, leaving state stale and the guard useless.
+    if (approvingRef.current) return;
+    // Also refuse anything not currently pending (e.g. reopened after approval)
+    const live = saleIntakes.find(i => i.id === intake.id);
+    if (!live || live.status !== "pending") {
+      alert("This intake was already " + (live ? live.status : "removed") + ". Nothing was created again.");
+      setReviewIntake(null);
+      return;
+    }
+    approvingRef.current = true;
+    try {
+      approveIntakeInner(intake);
+    } finally {
+      // Released on every path, including validation returns and thrown errors
+      approvingRef.current = false;
+    }
+  };
+  const approveIntakeInner = (intake) => {
+    const f = intake.fields || {};
+    if (intake.mode === "new_sale") {
+      // Build a newSale-shaped payload and call addSale-like path
+      const customerName = f.customer?.name || "";
+      if (!customerName.trim()) { alert("Customer name required — please edit before approving"); return; }
+      if (!f.items || f.items.length === 0) { alert("At least one item required"); return; }
+      // Period must be explicitly set — never silently default (breaks renewal tracking)
+      const missingPeriod = (f.items || []).findIndex(x => x.period_months == null);
+      if (missingPeriod >= 0) {
+        alert("Item " + (missingPeriod + 1) + " has no subscription period set.\n\nPick a period in the Items section before approving — guessing here would corrupt renewal dates.");
+        return;
+      }
+      const badPrice = (f.items || []).findIndex(x => !(Number(x.unit_price) > 0));
+      if (badPrice >= 0) {
+        alert("Item " + (badPrice + 1) + " has no unit price. Fill it in before approving.");
+        return;
+      }
+      // Duplicate-sale guard: same customer + same total + same day already open?
+      const claimedTotal = Number(f.totals?.total) || 0;
+      if (claimedTotal > 0) {
+        const tdy = todayStr();
+        const possibleDup = sales.find(s =>
+          !s.refunded &&
+          (s.customer || "").toLowerCase().trim() === customerName.toLowerCase().trim() &&
+          (s.price || 0) === claimedTotal &&
+          (s.soldDate === tdy || s.createdDate === tdy)
+        );
+        if (possibleDup) {
+          if (!confirm("⚠️ POSSIBLE DUPLICATE\n\nThere's already a sale today for:\n" + possibleDup.customer + " — " + possibleDup.service + " — " + possibleDup.price + " " + (possibleDup.currency || "EGP") + "\n\nCreate another one anyway?")) return;
+        }
+      }
+      // Payment reference duplicate guard
+      const newRefs = (f.payments || []).map(p => p.reference).filter(Boolean);
+      if (newRefs.length > 0) {
+        const refDup = sales.find(s => (s.partialPayments || []).some(p => p.reference && newRefs.includes(p.reference)));
+        if (refDup) {
+          if (!confirm("⚠️ PAYMENT REFERENCE ALREADY USED\n\nRef found on sale: " + refDup.customer + " — " + refDup.service + "\n\nThis may be a double-entry. Continue anyway?")) return;
+        }
+      }
+      // Build lines from items
+      const lines = f.items.map(it => {
+        // Map product ID back to service name
+        let serviceName = it.raw_text || svcNames[0] || "";
+        if (it.catalog_product_id && it.catalog_product_id.startsWith("svc_")) {
+          serviceName = it.catalog_product_id.slice(4);
+        }
+        if (!svcNames.includes(serviceName)) {
+          // Fallback: try matching by loose name
+          const match = svcNames.find(s => s.toLowerCase() === (serviceName || "").toLowerCase());
+          if (match) serviceName = match;
+          else serviceName = svcNames[0] || "Custom";
+        }
+        // qty × unit_price = line total (qty defaults to 1)
+        const qty = Number(it.qty) > 0 ? Number(it.qty) : 1;
+        const unit = Number(it.unit_price) || 0;
+        return {
+          service: serviceName,
+          // period is editable in review; default 1 month if not set
+          period: it.period_months != null ? Number(it.period_months) : 1,
+          price: qty * unit,
+          costPrice: 0,
+          currency: it.currency || f.totals?.currency || "EGP",
+        };
+      });
+      // Save this into newSale state and let user use the normal Add flow
+      // OR: directly call the same code paths
+      // For simplicity, we build the sale entries directly using existing logic
+      const soldDate = todayStr();
+      const created = [];
+      const transactionId = Date.now();
+      // Payment waterfall: pay off line 1 fully, then line 2, etc.
+      // This keeps every line's paid/unpaid status financially correct.
+      const paysToUse = (f.payments || []).slice(0, 2);
+      if ((f.payments || []).length > 2) {
+        console.warn("[Intake] More than 2 payments extracted; using first 2 only");
+      }
+      let payPool = paysToUse.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+      // Overpayment guard: money that can't be allocated to any line would vanish silently
+      const linesTotal = lines.reduce((s, L) => s + (L.price || 0), 0);
+      if (payPool > linesTotal + 0.01) {
+        if (!confirm(
+          "⚠️ PAYMENT EXCEEDS SALE TOTAL\n\n" +
+          "Paid: " + payPool + "\nItems total: " + linesTotal + "\n" +
+          "Unallocated: " + (payPool - linesTotal) + "\n\n" +
+          "The extra amount will NOT be recorded anywhere. Fix the item prices, or continue to record only " + linesTotal + "."
+        )) return;
+      }
+      // Track stock rows claimed during THIS approval — state doesn't update
+      // mid-loop, so without this two lines of the same service grab one account.
+      const claimedStockIds = new Set();
+      const claimStock = (product) => {
+        const row = stockRows.find(r => r.product === product && !r.sold && !claimedStockIds.has(r.id));
+        if (row) claimedStockIds.add(row.id);
+        return row;
+      };
+      lines.forEach((L, idx) => {
+        const saleId = transactionId + idx; // integer, matches addSale pattern
+        const currency = L.currency || "EGP";
+        const pe = toEgp(L.price, currency);
+        const ce = toEgp(L.costPrice || 0, currency);
+        const rD = L.period > 0
+          ? addMonths(soldDate, L.period)
+          : L.period === -1 ? "2099-12-31" : soldDate;
+        const available = claimStock(L.service);
+        const entry = {
+          id: saleId,
+          service: L.service,
+          customer: customerName,
+          customerPhone: f.customer?.phone || "",
+          customerEmail: "",
+          period: L.period,
+          price: L.price,
+          costPrice: L.costPrice || 0,
+          currency,
+          notes: "🧾 Created from intake #" + intake.id,
+          soldDate,
+          done: true, // approved intake → sale done
+          followUp: false,
+          renewDate: rD,
+          checklist: checklist.map(c => ({ label: c, checked: false })),
+          soldBy: cU ? cU.name : "?",
+          assignedTo: isAdmin ? null : memberId, // matches addSale auto-assign
+          createdDate: todayStr(),
+          priceEGP: pe, costEGP: ce,
+          paymentProof: null, proofStatus: "none",
+          linkedStockId: available ? available.id : null,
+          transactionId: lines.length > 1 ? transactionId : null,
+          intakeId: intake.id,
+          partialPayments: [], // populated below
+        };
+        // Allocate from the payment pool to THIS line (waterfall)
+        if (payPool > 0 && L.price > 0) {
+          const applied = Math.min(payPool, L.price);
+          payPool -= applied;
+          // Reference/method carried from the first extracted payment for traceability
+          const srcPay = paysToUse[0] || {};
+          const refNote = srcPay.reference ? "Ref: " + srcPay.reference : (srcPay.method_hint || "");
+          entry.partialPayments = [{
+            id: transactionId + 1000 + idx,
+            amount: applied,
+            note: (refNote ? refNote + " · " : "") + "via intake #" + intake.id
+              + (lines.length > 1 ? " (allocated " + applied + " of " + L.price + ")" : ""),
+            proof: null,
+            approvedBy: cU ? cU.name : "intake",
+            approvedAt: new Date().toISOString(),
+            type: "deposit",
+            reference: srcPay.reference || null,
+            method: srcPay.method_hint || null,
+          }];
+          const fullyPaid = applied >= L.price;
+          entry.paymentStatus = fullyPaid ? "fully_paid" : "partial_paid";
+          entry.proofStatus = fullyPaid ? "approved" : "partial_approved";
+        } else {
+          entry.paymentStatus = "none";
+          entry.proofStatus = "none";
+        }
+        if (available) {
+          setStockRows(p => p.map(r => r.id === available.id ? { ...r, sold: true, linkedSaleId: saleId } : r));
+        }
+        created.push(entry);
+      });
+      setSales(p => [...created, ...p]);
+      ensureCustomer(customerName, f.customer?.phone || "", "");
+      // Mark intake approved
+      setSaleIntakes(p => p.map(i => i.id === intake.id ? {
+        ...i,
+        status: "approved",
+        approvedBy: cU ? cU.name : "?",
+        approvedAt: new Date().toISOString(),
+        createdSaleIds: created.map(c => c.id),
+      } : i));
+      addLog("✅ Intake #" + intake.id + " approved → " + created.length + " sale(s) created");
+    } else if (intake.mode === "payment_on_existing") {
+      // Payment mode: attach payments to target sale
+      if (!f.target_sale_id) { alert("target_sale_id required — pick from open sales"); return; }
+      const rawTarget = String(f.target_sale_id); // model may return a number
+      const saleId = rawTarget.startsWith("sale_") ? Number(rawTarget.slice(5)) : Number(rawTarget);
+      if (!isFinite(saleId)) { alert("Invalid target sale ID: " + rawTarget); return; }
+      const sale = sales.find(s => s.id === saleId);
+      if (!sale) { alert("Target sale not found"); return; }
+      const total = sale.price || 0;
+      const prev = sale.partialPayments || [];
+      // Use the shared helper for the limit check so legacy sales settled via the
+      // old proof flow (no partialPayments) can't be paid a second time.
+      const paidSoFar = getPaidAmount(sale);
+      const remaining = getRemainingAmount(sale);
+      if (remaining <= 0) {
+        alert("This sale is already fully paid. Nothing to record.");
+        return;
+      }
+      // Enforce system limit: max 2 payments per sale total
+      const slotsLeft = 2 - prev.length;
+      if (slotsLeft <= 0) {
+        alert("This sale already has 2 payments (system max). Remove one first if you need to correct it.");
+        return;
+      }
+      const paysToUse = (f.payments || []).slice(0, slotsLeft);
+      if ((f.payments || []).length > slotsLeft) {
+        if (!confirm("Only " + slotsLeft + " payment slot(s) left on this sale. Use first " + slotsLeft + " payment(s) only?")) return;
+      }
+      const paymentAmount = paysToUse.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+      if (paymentAmount <= 0) { alert("Payment amount must be > 0"); return; }
+      if (paymentAmount > remaining) {
+        if (!confirm("Payment (" + paymentAmount + ") exceeds remaining (" + remaining + "). Continue anyway?")) return;
+      }
+      // Check for duplicate reference
+      const refs = paysToUse.map(p => p.reference).filter(Boolean);
+      if (refs.length > 0) {
+        const dup = sales.find(s => (s.partialPayments || []).some(p => p.reference && refs.includes(p.reference)));
+        if (dup) {
+          if (!confirm("⚠️ Reference already used on sale for " + dup.customer + " (" + dup.service + "). Continue anyway?")) return;
+        }
+      }
+      const payBaseId = Date.now();
+      const newPayments = paysToUse.map((p, i) => ({
+        id: payBaseId + i, // integer
+        amount: Number(p.amount) || 0,
+        note: p.reference ? "Ref: " + p.reference : (p.method_hint || ""),
+        proof: null,
+        approvedBy: cU ? cU.name : "?",
+        approvedAt: new Date().toISOString(),
+        type: prev.length + i === 0 ? "deposit" : "final",
+        reference: p.reference || null,
+        method: p.method_hint || null,
+      }));
+      const combined = [...prev, ...newPayments];
+      const newPaidTotal = paidSoFar + paymentAmount;
+      const fullyPaid = newPaidTotal >= total;
+      setSales(p => p.map(s => s.id === sale.id ? {
+        ...s,
+        partialPayments: combined,
+        paymentStatus: fullyPaid ? "fully_paid" : "partial_paid",
+        proofStatus: fullyPaid ? "approved" : "partial_approved",
+      } : s));
+      setSaleIntakes(p => p.map(i => i.id === intake.id ? {
+        ...i,
+        status: "approved",
+        approvedBy: cU ? cU.name : "?",
+        approvedAt: new Date().toISOString(),
+        appliedToSaleId: sale.id,
+      } : i));
+      addLog("✅ Intake #" + intake.id + " → payment " + paymentAmount + " on sale #" + sale.id);
+    }
+    setReviewIntake(null);
+  };
+  const rejectIntake = (intake, reason) => {
+    if (!isAdmin && !can("saleIntake")) { alert("Permission denied"); return; }
+    setSaleIntakes(p => p.map(i => i.id === intake.id ? {
+      ...i,
+      status: "rejected",
+      rejectedBy: cU ? cU.name : "?",
+      rejectedAt: new Date().toISOString(),
+      rejectionReason: reason || "",
+    } : i));
+    setReviewIntake(null);
+    addLog("❌ Intake #" + intake.id + " rejected");
+  };
+  // When a review opens, fetch a signed URL for each stored image.
+  // Keyed on the paths — NOT on reviewIntake — because that object is replaced on
+  // every keystroke in the modal, which would restart (and cancel) this on each edit.
+  const intakeUrlPaths = (reviewIntake?.images || [])
+    .map(im => im.storagePath)
+    .filter(Boolean)
+    .join("|");
+  const signingRef = useRef(new Set());
+  useEffect(() => {
+    if (!intakeUrlPaths) return;
+    const paths = intakeUrlPaths.split("|")
+      .filter(p => p && !intakeImageUrls[p] && !signingRef.current.has(p));
+    if (paths.length === 0) return;
+    paths.forEach(p => signingRef.current.add(p));
+    (async () => {
+      // Parallel: 8 images shouldn't take 8 round trips in series
+      const results = await Promise.all(
+        paths.map(async p => {
+          const r = await sb.signedUrl(p, 3600);
+          return [p, r.ok ? r.url : "ERROR:" + (r.error || "failed")];
+        })
+      );
+      paths.forEach(p => signingRef.current.delete(p));
+      setIntakeImageUrls(prev => {
+        const next = { ...prev };
+        results.forEach(([p, v]) => { next[p] = v; });
+        return next;
+      });
+    })();
+  }, [intakeUrlPaths, intakeImageUrls]);
+
+  const updateIntakeField = (intakeId, patch) => {
+    setSaleIntakes(p => p.map(i => i.id === intakeId ? {
+      ...i,
+      fields: { ...i.fields, ...patch },
+    } : i));
+    if (reviewIntake && reviewIntake.id === intakeId) {
+      setReviewIntake(prev => ({ ...prev, fields: { ...prev.fields, ...patch } }));
+    }
+  };
+
+  // ═══════════════════════════════════════════════════════════════════
   // 🎯 ADOBE TRACKER HELPERS
   // ═══════════════════════════════════════════════════════════════════
   const addAdobeAccount = (data) => {
@@ -2014,7 +2649,7 @@ export default function App() {
     const acc = adobeAccounts.find(a => a.id === id);
     if (!acc) return;
     // Check if any active rentals
-    const active = adobeRentals.filter(r => r.accountId === id && r.status === "active");
+    const active = adobeRentals.filter(r => r.accountId === id && isRentalRunning(r));
     if (active.length > 0) {
       if (!confirm("This account has " + active.length + " ACTIVE rental(s). Delete anyway?")) return;
     } else if (!confirm("Delete Adobe account " + acc.email + "?")) return;
@@ -2099,11 +2734,11 @@ export default function App() {
           const endD = new Date();
           endD.setHours(0, 0, 0, 0);
           endD.setDate(endD.getDate() + validDays);
-          custEndDate = endD.toISOString().slice(0, 10);
+          custEndDate = dateToStr(endD);
           // Compute start as end - planMonths
           const startD = new Date(endD);
           startD.setMonth(startD.getMonth() - planMonths);
-          custStartDate = startD.toISOString().slice(0, 10);
+          custStartDate = dateToStr(startD);
         } else if (row.startDate) {
           // Fallback: use account start as customer start
           custStartDate = row.startDate;
@@ -2148,8 +2783,9 @@ export default function App() {
     if (!sale) return;
     const total = sale.price || 0;
     const prev = sale.partialPayments || [];
-    const paidSoFar = prev.reduce((s, p) => s + (p.amount || 0), 0);
-    const remaining = total - paidSoFar;
+    const paidSoFar = getPaidAmount(sale);
+    const remaining = getRemainingAmount(sale);
+    if (remaining <= 0) { alert("This sale is already fully paid."); return; }
     const amt = Number(amount) || 0;
     if (amt <= 0) { alert("Amount must be > 0"); return; }
     if (amt > remaining) { alert("Amount exceeds remaining balance (" + remaining + ")"); return; }
@@ -2191,18 +2827,7 @@ export default function App() {
       };
     }));
   };
-  // Helper: how much paid so far
-  const getPaidAmount = (sale) => {
-    if (!sale) return 0;
-    const partials = sale.partialPayments || [];
-    if (partials.length > 0) return partials.reduce((s, p) => s + (p.amount || 0), 0);
-    if (sale.proofStatus === "approved") return sale.price || 0;
-    return 0;
-  };
-  const getRemainingAmount = (sale) => {
-    if (!sale) return 0;
-    return Math.max(0, (sale.price || 0) - getPaidAmount(sale));
-  };
+  // Helper: how much paid so far — see getPaidAmount defined above.
 
   // ─── Bulk ops (admin only) ───
   const bulkDone = () => {
@@ -2518,7 +3143,7 @@ export default function App() {
           const dataToSave = {
             services, sales, sConf, stockRows, guides, checklist, customers, logs,
             dark, comments, expenses, tasks, bundles, feedback, waTemplates, team,
-            dismissedN, seenN, suppliers, adobeAccounts, adobeRentals,
+            dismissedN, seenN, suppliers, adobeAccounts, adobeRentals, saleIntakes,
           };
           sb.saveData(workspaceOwnerId, dataToSave, ADMIN_EMAIL).then(r => {
             saveInFlight = false;
@@ -2555,7 +3180,7 @@ export default function App() {
     authStatus, svcNames, undoStack, isAdmin, workspaceOwnerId,
     services, sales, sConf, stockRows, guides, checklist, customers, logs,
     dark, comments, expenses, tasks, bundles, feedback, waTemplates, team,
-    dismissedN, seenN, suppliers, adobeAccounts, adobeRentals,
+    dismissedN, seenN, suppliers, adobeAccounts, adobeRentals, saleIntakes,
   ]);
 
   // ═══════════════════════════════════════════════════════════════════
@@ -2874,8 +3499,7 @@ export default function App() {
     // 💰 Partial payment dues — notify every day until cleared
     baseSales.forEach(s => {
       if (s.paymentStatus !== "partial_paid" || s.refunded) return;
-      const paid = (s.partialPayments || []).reduce((sum, p) => sum + (p.amount || 0), 0);
-      const remaining = (s.price || 0) - paid;
+      const remaining = getRemainingAmount(s);
       if (remaining <= 0) return;
       allN.push({
         id: "due" + s.id,
@@ -3163,6 +3787,7 @@ export default function App() {
     { id: "customers",    label: "Customers",  icon: "👤", memberKey: "customers" },
     { id: "adobe",        label: "Adobe",      icon: "🎨", memberKey: "adobe" },
     { id: "adobeTracker", label: "Adobe Tracker", icon: "🎯", memberKey: "adobeTracker" },
+    { id: "saleIntake",   label: "Sale Intake",   icon: "🧾", memberKey: "saleIntake" },
     { id: "renewals",     label: "Renewals",   icon: "🔄", memberKey: "renewals" },
     { id: "tasks",        label: "Tasks",      icon: "✅", memberKey: "tasks" },
     { id: "team",         label: "Team",       icon: "👥", memberKey: null },
@@ -3216,7 +3841,7 @@ export default function App() {
     const dataToSave = {
       services, sales, sConf, stockRows, guides, checklist, customers, logs,
       dark, comments, expenses, tasks, bundles, feedback, waTemplates, team,
-      dismissedN, seenN, suppliers, adobeAccounts, adobeRentals,
+      dismissedN, seenN, suppliers, adobeAccounts, adobeRentals, saleIntakes,
     };
     setSyncStatus("saving");
     saveInFlight = true;
@@ -3801,7 +4426,7 @@ export default function App() {
                       <div style={{ height: 6, background: t.border, borderRadius: 3, overflow: "hidden", marginBottom: 8 }}>
                         <div style={{
                           height: "100%",
-                          width: Math.min(100, (paid / selSale.price) * 100) + "%",
+                          width: (selSale.price > 0 ? Math.min(100, (paid / selSale.price) * 100) : 0) + "%",
                           background: fullyPaid ? t.success : t.warning,
                           transition: "width 0.3s",
                         }} />
@@ -3889,11 +4514,10 @@ export default function App() {
                 {(isAdmin || canEditSale(selSale)) && (
                   <button onClick={() => setProofModal({ saleId: selSale.id })} style={t.btnGhost}>📎 Proof</button>
                 )}
-                {(isAdmin || can("approveProofs")) && !selSale.refunded && selSale.paymentStatus !== "fully_paid" && (
+                {(isAdmin || can("approveProofs")) && !selSale.refunded && getRemainingAmount(selSale) > 0 && (
                   <button
                     onClick={() => {
-                      const paid = (selSale.partialPayments || []).reduce((s, p) => s + (p.amount || 0), 0);
-                      const remaining = (selSale.price || 0) - paid;
+                      const remaining = getRemainingAmount(selSale);
                       setPartialPayModal({
                         saleId: selSale.id,
                         amount: remaining,
@@ -4136,11 +4760,379 @@ export default function App() {
         {/* ─── PAYMENT PROOF MODAL ─── */}
         {/* ─── REFUND MODAL ─── */}
         {/* ═══ Partial Payment Modal ═══ */}
+        {/* ═══ Sale Intake Review Modal ═══ */}
+        {reviewIntake && (() => {
+          const it = reviewIntake;
+          const f = it.fields || {};
+          const conf = it.extracted?.confidence || {};
+          const custName = f.customer?.name || "";
+          const custPhone = f.customer?.phone || "";
+          const total = Number(f.totals?.total) || 0;
+          const payTotal = (f.payments || []).reduce((s, p) => s + (Number(p.amount) || 0), 0);
+          const remaining = total - payTotal;
+          const currency = f.totals?.currency || (f.items && f.items[0]?.currency) || "EGP";
+          // Confidence threshold
+          const LOW = 0.6;
+          const lowConfBadge = (v) => v != null && v < LOW ? (
+            <span style={{ background: t.warning + "33", color: t.warning, padding: "1px 6px", borderRadius: 8, fontSize: t.fs.xs, marginLeft: 6 }}>⚠️ low conf ({Math.round(v * 100)}%)</span>
+          ) : null;
+          return (
+            <div onClick={() => setReviewIntake(null)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: isMobile ? 0 : 20 }}>
+              <div onClick={e => e.stopPropagation()} style={{
+                background: t.cardBg, color: t.text,
+                width: "100%", maxWidth: isMobile ? "100%" : 900,
+                maxHeight: isMobile ? "100vh" : "90vh",
+                height: isMobile ? "100vh" : "auto", overflow: "auto",
+                borderRadius: isMobile ? 0 : 14, padding: isMobile ? 16 : 24,
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 10 }}>
+                  {isMobile && <button onClick={() => setReviewIntake(null)} style={{ ...t.btnGhost, padding: "10px 14px", fontWeight: 700 }}>← Back</button>}
+                  <h3 style={{ margin: 0, fontSize: t.fs.lg, fontWeight: 700, flex: 1 }}>
+                    🧾 Review Intake #{it.id}
+                  </h3>
+                  {!isMobile && <span onClick={() => setReviewIntake(null)} style={{ cursor: "pointer", fontSize: 24, color: t.textMuted }}>✕</span>}
+                </div>
+
+                {/* Money summary */}
+                <div style={{ ...t.card, marginBottom: 14, padding: 14, background: t.dark ? "#0c2620" : "#f0fdfa" }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, textAlign: "center" }}>
+                    <div>
+                      <div style={{ fontSize: t.fs.xs, color: t.textMuted, fontWeight: 700 }}>TOTAL</div>
+                      <div style={{ fontSize: t.fs.lg, fontWeight: 900, color: t.primary }}>{total.toLocaleString()}</div>
+                      <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>{currency}</div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: t.fs.xs, color: t.textMuted, fontWeight: 700 }}>PAID</div>
+                      <div style={{ fontSize: t.fs.lg, fontWeight: 900, color: t.success }}>{payTotal.toLocaleString()}</div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: t.fs.xs, color: t.textMuted, fontWeight: 700 }}>REMAINING</div>
+                      <div style={{ fontSize: t.fs.lg, fontWeight: 900, color: remaining > 0 ? t.warning : t.success }}>{remaining.toLocaleString()}</div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Two columns: images + fields */}
+                <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1.5fr", gap: 14 }}>
+                  {/* LEFT: Images */}
+                  <div>
+                    <label style={t.label}>📷 Source Images ({it.images.length})</label>
+                    {it.images.map((img, i) => {
+                      // Legacy intakes stored base64 inline; new ones use Storage.
+                      const legacySrc = img.base64 ? "data:" + img.mimeType + ";base64," + img.base64 : null;
+                      const signed = img.storagePath ? intakeImageUrls[img.storagePath] : null;
+                      const isErr = typeof signed === "string" && signed.startsWith("ERROR:");
+                      const src = legacySrc || (signed && !isErr ? signed : null);
+                      return (
+                        <div key={i} style={{ marginBottom: 10 }}>
+                          {src ? (
+                            <img
+                              src={src}
+                              alt={img.name}
+                              style={{ width: "100%", borderRadius: 8, cursor: "pointer" }}
+                              onClick={() => window.open(src, "_blank")}
+                            />
+                          ) : img.uploadError || isErr ? (
+                            <div style={{ background: t.dark ? "#450a0a" : "#fef2f2", padding: 14, borderRadius: 8, fontSize: t.fs.sm, color: t.danger }}>
+                              ⚠️ {img.name}<br/>
+                              <span style={{ fontSize: t.fs.xs }}>
+                                {img.uploadError ? "Upload failed: " + img.uploadError : signed.slice(6)}
+                              </span>
+                            </div>
+                          ) : img.storagePath ? (
+                            <div style={{ background: t.cardBg2, padding: 20, borderRadius: 8, textAlign: "center", color: t.textMuted, fontSize: t.fs.sm }}>
+                              ⏳ Loading {img.name}…
+                            </div>
+                          ) : (
+                            <div style={{ background: t.cardBg2, padding: 20, borderRadius: 8, textAlign: "center", color: t.textMuted, fontSize: t.fs.sm }}>
+                              📷 {img.name}<br/>
+                              <em style={{ fontSize: t.fs.xs }}>
+                                (uploaded before cloud storage — hash: {(img.sha256 || "").slice(0, 12)}…)
+                              </em>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {it.chat && (
+                      <div style={{ marginTop: 10, ...t.card, padding: 10 }}>
+                        <div style={{ fontSize: t.fs.xs, color: t.textMuted, marginBottom: 6, fontWeight: 700 }}>💬 YOUR NOTES</div>
+                        <div style={{ fontSize: t.fs.sm, whiteSpace: "pre-wrap" }}>{it.chat}</div>
+                      </div>
+                    )}
+                    {(it.extracted?.unresolved || []).length > 0 && (
+                      <div style={{ marginTop: 10, ...t.card, padding: 10, background: t.dark ? "#3f2510" : "#fff7ed", borderLeft: "3px solid " + t.warning }}>
+                        <div style={{ fontSize: t.fs.xs, color: t.warning, marginBottom: 6, fontWeight: 700 }}>⚠️ UNRESOLVED</div>
+                        {(it.extracted?.unresolved || []).map((u, i) => (
+                          <div key={i} style={{ fontSize: t.fs.xs, color: t.textMuted }}>• {u}</div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* RIGHT: Editable fields */}
+                  <div>
+                    {/* Mode */}
+                    <div style={{ marginBottom: 12 }}>
+                      <label style={t.label}>Mode</label>
+                      <div style={{ fontSize: t.fs.sm, padding: 8, background: t.cardBg2, borderRadius: 6 }}>
+                        {it.mode === "new_sale" ? "🆕 New Sale" : "💰 Payment on Existing"}
+                      </div>
+                    </div>
+
+                    {/* Target sale (only for payment mode) */}
+                    {it.mode === "payment_on_existing" && (
+                      <div style={{ marginBottom: 12 }}>
+                        <label style={t.label}>Target Sale *</label>
+                        <select
+                          value={f.target_sale_id || ""}
+                          onChange={e => updateIntakeField(it.id, { target_sale_id: e.target.value })}
+                          style={t.input}
+                        >
+                          <option value="">— Select open sale —</option>
+                          {sales.filter(isOpenSale).map(s => {
+                            const rem = getRemainingAmount(s);
+                            return (
+                              <option key={s.id} value={"sale_" + s.id}>
+                                {s.customer} — {s.service} — rem {rem} {s.currency || "EGP"} ({s.soldDate})
+                              </option>
+                            );
+                          })}
+                        </select>
+                      </div>
+                    )}
+
+                    {/* Customer */}
+                    <div style={{ marginBottom: 12 }}>
+                      <label style={t.label}>👤 Customer {lowConfBadge(conf.customer)}</label>
+                      <input
+                        value={custName}
+                        onChange={e => updateIntakeField(it.id, { customer: { ...f.customer, name: e.target.value } })}
+                        style={t.input}
+                        list="cust-picker"
+                      />
+                      <datalist id="cust-picker">
+                        {customers.slice(0, 100).map(c => <option key={c.id} value={c.name}>{c.phone}</option>)}
+                      </datalist>
+                      <input
+                        value={custPhone}
+                        onChange={e => updateIntakeField(it.id, { customer: { ...f.customer, phone: e.target.value } })}
+                        placeholder="📞 Phone"
+                        style={{ ...t.input, marginTop: 6 }}
+                      />
+                    </div>
+
+                    {/* Items */}
+                    {it.mode === "new_sale" && (
+                      <div style={{ marginBottom: 12 }}>
+                        <label style={t.label}>🛍 Items ({(f.items || []).length}) {lowConfBadge(conf.items)}</label>
+                        {(f.items || []).map((item, idx) => (
+                          <div key={idx} style={{ ...t.card, padding: 10, marginBottom: 6 }}>
+                            <div style={{ fontSize: t.fs.xs, color: t.textMuted, marginBottom: 4 }}>Raw: {item.raw_text}</div>
+                            <select
+                              value={item.catalog_product_id || ""}
+                              onChange={e => {
+                                const items = [...(f.items || [])];
+                                items[idx] = { ...item, catalog_product_id: e.target.value };
+                                updateIntakeField(it.id, { items });
+                              }}
+                              style={t.input}
+                            >
+                              <option value="">— Match to product —</option>
+                              {svcNames.map(s => <option key={s} value={"svc_" + s}>{s}</option>)}
+                            </select>
+                            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginTop: 6 }}>
+                              <div>
+                                <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>Qty</div>
+                                <input
+                                  type="number"
+                                  placeholder="Qty"
+                                  value={item.qty ?? 1}
+                                  onChange={e => {
+                                    const items = [...(f.items || [])];
+                                    items[idx] = { ...item, qty: Number(e.target.value) || 0 };
+                                    updateIntakeField(it.id, { items });
+                                  }}
+                                  style={t.input}
+                                />
+                              </div>
+                              <div>
+                                <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>Unit price</div>
+                                <input
+                                  type="number"
+                                  placeholder="Unit price"
+                                  value={item.unit_price ?? ""}
+                                  onChange={e => {
+                                    const items = [...(f.items || [])];
+                                    items[idx] = { ...item, unit_price: Number(e.target.value) || 0 };
+                                    updateIntakeField(it.id, { items });
+                                  }}
+                                  style={t.input}
+                                />
+                              </div>
+                              <div>
+                                <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>Period *</div>
+                                <select
+                                  value={item.period_months ?? ""}
+                                  onChange={e => {
+                                    const items = [...(f.items || [])];
+                                    items[idx] = { ...item, period_months: e.target.value === "" ? null : Number(e.target.value) };
+                                    updateIntakeField(it.id, { items });
+                                  }}
+                                  style={{ ...t.input, borderColor: item.period_months == null ? t.danger : undefined }}
+                                >
+                                  <option value="">— not set —</option>
+                                  <option value={0}>One-time</option>
+                                  <option value={1}>1 month</option>
+                                  <option value={2}>2 months</option>
+                                  <option value={3}>3 months</option>
+                                  <option value={6}>6 months</option>
+                                  <option value={12}>12 months</option>
+                                  <option value={-1}>Lifetime</option>
+                                </select>
+                              </div>
+                            </div>
+                            <div style={{ fontSize: t.fs.xs, color: t.primary, marginTop: 4, fontWeight: 700 }}>
+                              Line total: {((Number(item.qty) > 0 ? Number(item.qty) : 1) * (Number(item.unit_price) || 0)).toLocaleString()} {item.currency || f.totals?.currency || "EGP"}
+                            </div>
+                          </div>
+                        ))}
+                        {/* Items sum vs stated total mismatch warning */}
+                        {(() => {
+                          const itemsSum = (f.items || []).reduce((s, x) =>
+                            s + ((Number(x.qty) > 0 ? Number(x.qty) : 1) * (Number(x.unit_price) || 0)), 0);
+                          const stated = Number(f.totals?.total) || 0;
+                          if (stated > 0 && Math.abs(itemsSum - stated) > 0.01) {
+                            return (
+                              <div style={{ padding: 8, background: t.dark ? "#3f2510" : "#fff7ed", borderRadius: 6, fontSize: t.fs.xs, color: t.warning, fontWeight: 600 }}>
+                                ⚠️ Items sum ({itemsSum.toLocaleString()}) ≠ stated total ({stated.toLocaleString()}). Sales are created from the ITEMS.
+                              </div>
+                            );
+                          }
+                          return null;
+                        })()}
+                      </div>
+                    )}
+
+                    {/* Payments (needs explicit confirm) */}
+                    <div style={{ marginBottom: 12 }}>
+                      <label style={t.label}>💰 Payments ({(f.payments || []).length}) {lowConfBadge(conf.payments)}</label>
+                      {(f.payments || []).length === 0 ? (
+                        <div style={{ padding: 10, background: t.cardBg2, borderRadius: 6, fontSize: t.fs.sm, color: t.textMuted }}>
+                          No payments extracted — sale placed without payment yet.
+                        </div>
+                      ) : (f.payments || []).map((pay, idx) => (
+                        <div key={idx} style={{ ...t.card, padding: 10, marginBottom: 6, background: t.dark ? "#450a0a22" : "#fef2f222" }}>
+                          <div style={{ fontSize: t.fs.xs, color: t.warning, marginBottom: 4, fontWeight: 700 }}>⚠️ CONFIRM: amount + reference</div>
+                          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+                            <input
+                              type="number"
+                              placeholder="Amount"
+                              value={pay.amount || ""}
+                              onChange={e => {
+                                const payments = [...(f.payments || [])];
+                                payments[idx] = { ...pay, amount: Number(e.target.value) || 0 };
+                                updateIntakeField(it.id, { payments });
+                              }}
+                              style={{ ...t.input, fontSize: t.fs.md, fontWeight: 700, borderColor: pay.amount ? t.border : t.danger }}
+                            />
+                            <input
+                              placeholder="Reference #"
+                              value={pay.reference || ""}
+                              onChange={e => {
+                                const payments = [...(f.payments || [])];
+                                payments[idx] = { ...pay, reference: e.target.value };
+                                updateIntakeField(it.id, { payments });
+                              }}
+                              style={t.input}
+                            />
+                          </div>
+                          <input
+                            placeholder="Method (Vodafone Cash / InstaPay / Bank...)"
+                            value={pay.method_hint || ""}
+                            onChange={e => {
+                              const payments = [...(f.payments || [])];
+                              payments[idx] = { ...pay, method_hint: e.target.value };
+                              updateIntakeField(it.id, { payments });
+                            }}
+                            style={{ ...t.input, marginTop: 6 }}
+                          />
+                          {pay.fx_rate === null && pay.currency && f.totals?.currency && pay.currency !== f.totals.currency && (
+                            <div style={{ fontSize: t.fs.xs, color: t.warning, marginTop: 4 }}>
+                              ⚠️ Currency differs from sale — enter FX rate:
+                              <input
+                                type="number"
+                                step="0.01"
+                                placeholder="FX rate"
+                                value={pay.fx_rate || ""}
+                                onChange={e => {
+                                  const payments = [...(f.payments || [])];
+                                  payments[idx] = { ...pay, fx_rate: Number(e.target.value) || null };
+                                  updateIntakeField(it.id, { payments });
+                                }}
+                                style={{ ...t.input, marginTop: 4 }}
+                              />
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Totals */}
+                    <div style={{ marginBottom: 12 }}>
+                      <label style={t.label}>💵 Total {lowConfBadge(conf.totals)}</label>
+                      <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 6 }}>
+                        <input
+                          type="number"
+                          value={f.totals?.total || ""}
+                          onChange={e => updateIntakeField(it.id, { totals: { ...f.totals, total: Number(e.target.value) || 0 } })}
+                          style={t.input}
+                        />
+                        <select
+                          value={f.totals?.currency || "EGP"}
+                          onChange={e => updateIntakeField(it.id, { totals: { ...f.totals, currency: e.target.value } })}
+                          style={t.input}
+                        >
+                          <option value="EGP">EGP</option>
+                          <option value="USD">USD</option>
+                          <option value="SAR">SAR</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    {/* Metadata */}
+                    <div style={{ ...t.card, padding: 8, marginBottom: 14, fontSize: t.fs.xs, color: t.textMuted }}>
+                      🤖 {it.model} · {it.tokensIn}→{it.tokensOut} tokens
+                      {it.thoughtsTokens > 0 && " (+" + it.thoughtsTokens + " thoughts)"}
+                    </div>
+
+                    {/* Action buttons */}
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      <button
+                        onClick={() => {
+                          const reason = prompt("Reason for rejection (optional):");
+                          rejectIntake(it, reason || "");
+                        }}
+                        style={{ ...t.btnGhost, color: t.danger, borderColor: t.danger, flex: 1 }}
+                      >❌ Reject</button>
+                      <button
+                        onClick={() => approveIntake(it)}
+                        disabled={!isAdmin && !can("saleIntake")}
+                        style={{ ...t.btnPrimary, background: t.success, flex: 2 }}
+                      >✅ Approve & Create</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
         {partialPayModal && (() => {
           const pm = partialPayModal;
           const sale = pm.sale;
-          const paid = (sale.partialPayments || []).reduce((s, p) => s + (p.amount || 0), 0);
-          const totalRemaining = (sale.price || 0) - paid;
+          const paid = getPaidAmount(sale);
+          const totalRemaining = getRemainingAmount(sale);
           const isFinal = (sale.partialPayments || []).length === 1; // 2nd payment = final
           const amt = Number(pm.amount) || 0;
           const wouldBeFullyPaid = (paid + amt) >= sale.price;
@@ -5620,7 +6612,7 @@ export default function App() {
                       // Get accounts that are available (not currently rented)
                       const usedAccountIds = new Set(
                         adobeRentals
-                          .filter(r => r.status === "active" && daysLeft(r.endDate) >= 0)
+                          .filter(isRentalRunning)
                           .map(r => r.accountId)
                       );
                       const availableAccs = adobeAccounts.filter(a => !a.banned && !usedAccountIds.has(a.id));
@@ -7058,6 +8050,220 @@ export default function App() {
         )}
 
         {/* ═══════════════════════════════════════════════════════════════
+             🧾 SALE INTAKE TAB — AI extraction from WhatsApp screenshots
+             ═══════════════════════════════════════════════════════════════ */}
+        {tab === "saleIntake" && (() => {
+          const canEdit = isAdmin || can("saleIntake");
+          const pending = saleIntakes.filter(i => i.status === "pending");
+          const history = saleIntakes.filter(i => i.status !== "pending");
+          return (
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
+                <h2 style={{ margin: 0, fontSize: t.fs.xl, fontWeight: 800 }}>🧾 Sale Intake (AI)</h2>
+                <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>Powered by Gemini</div>
+              </div>
+
+              {/* Sub-tabs */}
+              <div style={{ display: "flex", gap: 4, marginBottom: 14, borderBottom: "1px solid " + t.border, overflowX: "auto" }}>
+                {[
+                  { id: "new",     l: "➕ New Intake" },
+                  { id: "pending", l: "⏳ Pending Review (" + pending.length + ")" },
+                  { id: "history", l: "📜 History (" + history.length + ")" },
+                ].map(s => (
+                  <button
+                    key={s.id}
+                    onClick={() => setIntakeSubTab(s.id)}
+                    style={{
+                      padding: "10px 16px",
+                      background: intakeSubTab === s.id ? t.primary : "transparent",
+                      color: intakeSubTab === s.id ? "#fff" : t.text,
+                      border: "none", borderRadius: "8px 8px 0 0",
+                      fontWeight: 700, fontSize: t.fs.sm, cursor: "pointer",
+                      whiteSpace: "nowrap", flexShrink: 0,
+                    }}
+                  >{s.l}</button>
+                ))}
+              </div>
+
+              {/* SUB-TAB: NEW INTAKE */}
+              {intakeSubTab === "new" && (
+                <div>
+                  {/* Mode selector */}
+                  <div style={{ ...t.card, marginBottom: 14 }}>
+                    <label style={t.label}>Mode</label>
+                    <div style={{ display: "flex", gap: 8, flexDirection: isMobile ? "column" : "row" }}>
+                      <label style={{ flex: 1, display: "flex", gap: 8, alignItems: "center", padding: 12, background: intakeMode === "new_sale" ? (t.dark ? "#0c2620" : "#e8f4f2") : t.cardBg2, borderRadius: 8, cursor: "pointer", border: "1px solid " + (intakeMode === "new_sale" ? t.primary : t.border) }}>
+                        <input type="radio" checked={intakeMode === "new_sale"} onChange={() => setIntakeMode("new_sale")} />
+                        <div>
+                          <strong>🆕 New Sale</strong>
+                          <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>Extract full sale (customer + items + payment)</div>
+                        </div>
+                      </label>
+                      <label style={{ flex: 1, display: "flex", gap: 8, alignItems: "center", padding: 12, background: intakeMode === "payment_on_existing" ? (t.dark ? "#3f2510" : "#fff7ed") : t.cardBg2, borderRadius: 8, cursor: "pointer", border: "1px solid " + (intakeMode === "payment_on_existing" ? "#f97316" : t.border) }}>
+                        <input type="radio" checked={intakeMode === "payment_on_existing"} onChange={() => setIntakeMode("payment_on_existing")} />
+                        <div>
+                          <strong>💰 Payment on Existing</strong>
+                          <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>Add payment to an existing open sale</div>
+                        </div>
+                      </label>
+                    </div>
+                  </div>
+
+                  {/* Image upload */}
+                  <div style={{ ...t.card, marginBottom: 14 }}>
+                    <label style={t.label}>📷 Images ({intakeImages.length}/8)</label>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      onChange={async (e) => {
+                        const files = Array.from(e.target.files || []);
+                        for (const f of files) await addIntakeImage(f);
+                        e.target.value = ""; // reset
+                      }}
+                      style={{ ...t.input, padding: 10 }}
+                      disabled={!canEdit || intakeImages.length >= 8}
+                    />
+                    <div style={{ fontSize: t.fs.xs, color: t.textMuted, marginTop: 4 }}>
+                      ℹ️ WhatsApp screenshots + receipt image. Max 4 MB each, 8 images total.
+                    </div>
+                    {intakeImages.length > 0 && (
+                      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(4, 1fr)", gap: 8, marginTop: 12 }}>
+                        {intakeImages.map((img, idx) => (
+                          <div key={idx} style={{ position: "relative", background: t.cardBg2, borderRadius: 6, padding: 6 }}>
+                            <img
+                              src={"data:" + img.mimeType + ";base64," + img.base64}
+                              alt={img.name}
+                              style={{ width: "100%", height: 100, objectFit: "cover", borderRadius: 4 }}
+                            />
+                            <div style={{ fontSize: t.fs.xs, color: t.textMuted, marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {img.name} ({Math.round(img.size / 1024)}KB)
+                            </div>
+                            <button
+                              onClick={() => removeIntakeImage(idx)}
+                              style={{
+                                position: "absolute", top: 4, right: 4,
+                                background: t.danger, color: "#fff",
+                                border: "none", borderRadius: "50%",
+                                width: 24, height: 24, cursor: "pointer",
+                                fontWeight: 700,
+                              }}
+                            >×</button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Chat notes */}
+                  <div style={{ ...t.card, marginBottom: 14 }}>
+                    <label style={t.label}>💬 Notes (optional)</label>
+                    <textarea
+                      value={intakeChat}
+                      onChange={e => setIntakeChat(e.target.value)}
+                      placeholder="Any context you want to add: 'This is payment on Ahmed's Adobe sale', 'Customer paid in USD', etc."
+                      rows={4}
+                      style={{ ...t.input, fontFamily: "inherit", resize: "vertical" }}
+                    />
+                  </div>
+
+                  {/* Error */}
+                  {intakeError && (
+                    <div style={{ ...t.card, marginBottom: 14, background: t.dark ? "#450a0a" : "#fef2f2", borderLeft: "3px solid " + t.danger }}>
+                      <strong style={{ color: t.danger }}>⚠️ Error:</strong>
+                      <div style={{ fontSize: t.fs.sm, marginTop: 6, color: t.textMuted, wordBreak: "break-word" }}>
+                        {intakeError}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Analyze button */}
+                  <button
+                    onClick={analyzeIntake}
+                    disabled={intakeAnalyzing || intakeImages.length === 0 || !canEdit}
+                    style={{
+                      ...t.btnPrimary, width: "100%",
+                      opacity: (intakeAnalyzing || intakeImages.length === 0 || !canEdit) ? 0.5 : 1,
+                      fontSize: t.fs.base, padding: 14,
+                    }}
+                  >
+                    {intakeAnalyzing ? "⏳ Analyzing (may take 5-15s)..." : "🤖 Analyze with Gemini"}
+                  </button>
+                  {!canEdit && (
+                    <div style={{ fontSize: t.fs.xs, color: t.textMuted, textAlign: "center", marginTop: 8 }}>
+                      🔒 You need "Sale Intake" permission to use this.
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* SUB-TAB: PENDING */}
+              {intakeSubTab === "pending" && (
+                <div>
+                  {pending.length === 0 ? (
+                    <div style={{ ...t.card, textAlign: "center", padding: 40, color: t.textMuted }}>
+                      <div style={{ fontSize: 40, marginBottom: 10 }}>📭</div>
+                      <p>No pending intakes.</p>
+                    </div>
+                  ) : pending.map(intake => (
+                    <div key={intake.id} onClick={() => setReviewIntake(intake)} style={{
+                      ...t.card, marginBottom: 10, padding: 14, cursor: "pointer",
+                      borderLeft: "3px solid " + t.warning,
+                    }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <strong>#{intake.id}</strong>{" · "}
+                          <span style={{ fontSize: t.fs.sm }}>{intake.mode === "new_sale" ? "🆕 New Sale" : "💰 Payment"}</span>
+                          <div style={{ fontSize: t.fs.xs, color: t.textMuted, marginTop: 4 }}>
+                            {intake.fields?.customer?.name || "?"} · {(intake.fields?.items || []).length} item(s)
+                            {intake.fields?.totals?.total ? " · " + intake.fields.totals.total + " " + (intake.fields.totals.currency || "EGP") : ""}
+                          </div>
+                          <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>
+                            {new Date(intake.createdAt).toLocaleString()} · {intake.createdBy}
+                          </div>
+                        </div>
+                        <button style={{ ...t.btnPrimary, padding: "6px 14px", fontSize: t.fs.xs }}>Review →</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* SUB-TAB: HISTORY */}
+              {intakeSubTab === "history" && (
+                <div>
+                  {history.length === 0 ? (
+                    <div style={{ ...t.card, textAlign: "center", padding: 40, color: t.textMuted }}>
+                      <p>No historical intakes.</p>
+                    </div>
+                  ) : history.map(intake => (
+                    <div key={intake.id} style={{
+                      ...t.card, marginBottom: 8, padding: 10,
+                      borderLeft: "3px solid " + (intake.status === "approved" ? t.success : t.danger),
+                    }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                        <div style={{ minWidth: 0, flex: 1 }}>
+                          <strong>#{intake.id}</strong> · <span style={{ color: intake.status === "approved" ? t.success : t.danger, fontWeight: 700 }}>{intake.status === "approved" ? "✅ Approved" : "❌ Rejected"}</span>
+                          <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>
+                            {intake.fields?.customer?.name || "?"} · {new Date(intake.createdAt).toLocaleDateString()}
+                          </div>
+                        </div>
+                        {intake.status === "approved" && intake.createdSaleIds && (
+                          <span style={{ fontSize: t.fs.xs, color: t.primary }}>
+                            → {intake.createdSaleIds.length} sale(s)
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
+
+        {/* ═══════════════════════════════════════════════════════════════
              🎯 ADOBE TRACKER TAB — accounts, rentals, history
              ═══════════════════════════════════════════════════════════════ */}
         {tab === "adobeTracker" && (() => {
@@ -7085,7 +8291,7 @@ export default function App() {
                 && !(a.note || "").toLowerCase().includes(q)) return false;
             }
             const r = accountRentalMap[a.id];
-            const isActive = r && r.status === "active" && daysLeft(r.endDate) >= 0;
+            const isActive = isRentalRunning(r);
             if (atAccountFilter === "available") return !a.banned && !isActive;
             if (atAccountFilter === "rented") return isActive;
             if (atAccountFilter === "banned") return a.banned;
@@ -7093,7 +8299,7 @@ export default function App() {
           });
           // Active rentals
           const activeRentalsAll = adobeRentals
-            .filter(r => r.status === "active")
+            .filter(isRentalRunning)
             .map(r => ({ ...r, daysToEnd: getCustomerDaysLeft(r) || 0, acc: adobeAccounts.find(a => a.id === r.accountId) }))
             .sort((a, b) => a.daysToEnd - b.daysToEnd);
           const activeRentals = atActiveSearch
@@ -7107,7 +8313,7 @@ export default function App() {
             : activeRentalsAll;
           // History rentals
           const historyRentalsAll = adobeRentals
-            .filter(r => r.status !== "active" || daysLeft(r.endDate) < 0)
+            .filter(r => !isRentalRunning(r))
             .map(r => ({ ...r, acc: adobeAccounts.find(a => a.id === r.accountId) }))
             .sort((a, b) => (b.endDate || "").localeCompare(a.endDate || ""));
           const historyRentals = atHistorySearch
@@ -7122,7 +8328,7 @@ export default function App() {
           const totalAcc = adobeAccounts.length;
           const rentedCount = adobeAccounts.filter(a => {
             const r = accountRentalMap[a.id];
-            return r && r.status === "active" && daysLeft(r.endDate) >= 0;
+            return isRentalRunning(r);
           }).length;
           const availCount = adobeAccounts.filter(a => !a.banned && isAccountAvailable(a)).length;
           const bannedCount = adobeAccounts.filter(a => a.banned).length;
@@ -7240,7 +8446,7 @@ export default function App() {
                   ) : isMobile ? (
                     filteredAccounts.map(acc => {
                       const r = accountRentalMap[acc.id];
-                      const active = r && r.status === "active" && daysLeft(r.endDate) >= 0;
+                      const active = isRentalRunning(r);
                       const accDaysLeft = acc.accountEndDate ? daysLeft(acc.accountEndDate) : null;
                       const stColor = acc.banned ? t.danger : active ? "#8b5cf6" : t.success;
                       const accColor = accDaysLeft === null ? t.textMuted : accDaysLeft < 0 ? t.danger : accDaysLeft <= 30 ? "#f97316" : t.success;
@@ -7291,7 +8497,7 @@ export default function App() {
                           <tbody>
                             {filteredAccounts.map(acc => {
                               const r = accountRentalMap[acc.id];
-                              const active = r && r.status === "active" && daysLeft(r.endDate) >= 0;
+                              const active = isRentalRunning(r);
                               const accDaysLeft = acc.accountEndDate ? daysLeft(acc.accountEndDate) : null;
                               const accColor = accDaysLeft === null ? t.textMuted : accDaysLeft < 0 ? t.danger : accDaysLeft <= 30 ? "#f97316" : t.success;
                               const custDaysLeft = r ? getCustomerDaysLeft(r) : null;
@@ -10671,8 +11877,8 @@ export default function App() {
             {repTab === "adobeTrk" && (() => {
               const tdy = todayStr();
               // Active rentals
-              const active = adobeRentals.filter(r => r.status === "active" && daysLeft(r.endDate) >= 0);
-              const expired = adobeRentals.filter(r => r.status === "active" && daysLeft(r.endDate) < 0);
+              const active = adobeRentals.filter(isRentalRunning);
+              const expired = adobeRentals.filter(r => r.status === "active" && !isRentalRunning(r));
               const completed = adobeRentals.filter(r => r.status !== "active");
               // Accounts breakdown
               const totalAccs = adobeAccounts.length;
