@@ -150,6 +150,9 @@ const sb = {
     if (!workspaceOwnerId) return null;
     const key = "ws_" + workspaceOwnerId;
     const r = await this.req("/rest/v1/proskill_workspace?workspace_key=eq." + key + "&select=data&limit=1");
+    // Distinguish "the request failed" from "no workspace exists yet". Both used
+    // to return null, so a brand-new account looked identical to a broken load.
+    this.lastLoadOk = !!(r.ok && Array.isArray(r.data));
     if (r.ok && Array.isArray(r.data) && r.data.length > 0) return r.data[0].data;
     return null;
   },
@@ -158,6 +161,7 @@ const sb = {
     if (!adminEmail) return null;
     const key = "ws_email_" + adminEmail.toLowerCase();
     const r = await this.req("/rest/v1/proskill_workspace?workspace_key=eq." + encodeURIComponent(key) + "&select=data,owner_id&limit=1");
+    this.lastLoadOk = !!(r.ok && Array.isArray(r.data));
     if (r.ok && Array.isArray(r.data) && r.data.length > 0) {
       return { data: r.data[0].data, ownerId: r.data[0].owner_id };
     }
@@ -1038,6 +1042,13 @@ export default function App() {
   // ─── APP DATA ───
   const [services, setServices] = useState(DEFAULT_SERVICES);
   const [sales, setSales] = useState([]);
+  // ═══ DATA-LOSS GUARDS ═══
+  // False until a load actually returned data (or confirmed there is none yet).
+  const loadSucceededRef = useRef(false);
+  // Last known-good collection sizes, used to catch a mass wipe before it saves.
+  const lastGoodCountsRef = useRef(null);
+  // True when this session's data came from the device backup, not the cloud.
+  const restoredFromBackupRef = useRef(false);
   const [sConf, setSConf] = useState({});
   const [stockRows, setStockRows] = useState([]);
   const [guides, setGuides] = useState([]);
@@ -1054,6 +1065,40 @@ export default function App() {
   const [team, setTeam] = useState([]);
   const [dark, setDark] = useState(false);
   const [undoStack, setUndoStack] = useState([]);
+
+  // Single gate for EVERY write to the cloud or the local backup.
+  // Four different code paths can save; they must all ask the same question,
+  // or one of them becomes the hole that erases the workspace.
+  const canSaveNow = () => {
+    if (!loadSucceededRef.current) {
+      return { ok: false, reason: "The workspace never loaded, so this session holds no data.\nSaving is disabled so your cloud copy is not overwritten.\n\nReload the page and wait for your data to appear." };
+    }
+    // Data restored from this device's backup may be OLDER than what is in the
+    // cloud — the local copy silently stops updating once storage fills up.
+    // Pushing it would overwrite newer work, so it needs an explicit decision.
+    if (restoredFromBackupRef.current) {
+      return { ok: false, reason: "This session was restored from an offline copy on this device, which may be out of date.\n\nSaving is paused so it cannot overwrite newer data in the cloud.\nReload while online to load the real workspace." };
+    }
+    const prev = lastGoodCountsRef.current;
+    if (prev) {
+      const gone = [];
+      if ((prev.sales || 0) >= 3 && sales.length === 0) gone.push("sales");
+      if ((prev.customers || 0) >= 3 && customers.length === 0) gone.push("customers");
+      if ((prev.stockRows || 0) >= 3 && stockRows.length === 0) gone.push("stock");
+      if ((prev.team || 0) >= 3 && team.length === 0) gone.push("team");
+      if (gone.length) {
+        return { ok: false, reason: "Everything vanished from " + gone.join(", ") + " in this session.\nThat is never a normal edit, so saving is blocked.\n\nReload the page to restore from the cloud." };
+      }
+    }
+    return { ok: true };
+  };
+  // Called only after a save is allowed through.
+  const rememberGoodCounts = () => {
+    lastGoodCountsRef.current = {
+      sales: sales.length, customers: customers.length,
+      stockRows: stockRows.length, team: team.length,
+    };
+  };
 
   // ─── UI STATE ───
   const [tab, setTab] = useState("dashboard");
@@ -1257,6 +1302,9 @@ export default function App() {
             if (backup) {
               const parsed = JSON.parse(backup);
               d = parsed.data;
+              restoredFromBackupRef.current = true;
+              console.warn("[ProSkill] ⚠️ Restored from device backup saved at", parsed.savedAt,
+                "— this may be older than the cloud. Saving is paused.");
             }
           } catch {}
         }
@@ -1276,6 +1324,9 @@ export default function App() {
             if (backup) {
               const parsed = JSON.parse(backup);
               d = parsed.data;
+              restoredFromBackupRef.current = true;
+              console.warn("[ProSkill] ⚠️ Restored from device backup saved at", parsed.savedAt,
+                "— this may be older than the cloud. Saving is paused.");
             }
           } catch {}
         }
@@ -1294,6 +1345,9 @@ export default function App() {
             if (backup) {
               const parsed = JSON.parse(backup);
               d = parsed.data;
+              restoredFromBackupRef.current = true;
+              console.warn("[ProSkill] ⚠️ Restored from device backup saved at", parsed.savedAt,
+                "— this may be older than the cloud. Saving is paused.");
             }
           } catch {}
         }
@@ -1305,12 +1359,53 @@ export default function App() {
       setWorkspaceOwnerId(user.id);
       setLoaded(true);
     } catch (e) {
+      console.error("[ProSkill] load threw:", e);
       setLoaded(true);
+    }
+    if (!loadSucceededRef.current) {
+      // sb.lastLoadOk true means the request succeeded and there simply is no
+      // workspace row yet — a first run. That must be allowed to save, otherwise
+      // a new account could never store anything.
+      if (sb.lastLoadOk) {
+        loadSucceededRef.current = true;
+        console.log("[ProSkill] No workspace found — starting a fresh one.");
+      } else {
+        console.error("[ProSkill] ⛔ Workspace did not load. Saving is disabled to protect your data.");
+        setSyncStatus("error");
+        alert(
+          "⚠️ Could not load your workspace.\n\n" +
+          "Saving has been DISABLED so your existing data is not overwritten.\n\n" +
+          "Check your connection and reload the page. Do not enter anything until the data appears."
+        );
+      }
+    } else if (restoredFromBackupRef.current) {
+      setSyncStatus("error");
+      alert(
+        "⚠️ Showing an offline copy from this device.\n\n" +
+        "The cloud could not be reached, so what you see may be OUT OF DATE.\n" +
+        "Saving is paused so it cannot overwrite newer data.\n\n" +
+        "Reload once you are online to load the real workspace."
+      );
     }
   };
 
+  // A truthy object is not proof of a real load: an empty {} from a corrupted or
+  // previously-blanked row would sail through and re-authorise saving emptiness.
+  // Demand at least one recognisable collection.
+  const looksLikeWorkspace = (d) => !!d && typeof d === "object" && [
+    "sales", "customers", "services", "svcs", "stockRows", "team", "tasks", "sConf",
+  ].some(k => Array.isArray(d[k]) || (k === "sConf" && d[k] && typeof d[k] === "object"));
+
   const applyLoadedData = (d) => {
     if (!d) return;
+    if (!looksLikeWorkspace(d)) {
+      console.error("[ProSkill] ⛔ Loaded record has no recognisable data — treating as a failed load.", d);
+      return; // leaves loadSucceededRef false, so saving stays blocked
+    }
+    // Records that real data arrived. Without this, a failed load leaves the app
+    // holding empty arrays — and the autosave below would write that emptiness
+    // over both the cloud copy and the local backup.
+    loadSucceededRef.current = true;
     if (d.services) setServices(d.services);
     else if (d.svcs) setServices(d.svcs);
     if (d.sales) setSales(d.sales);
@@ -1345,19 +1440,34 @@ export default function App() {
   useEffect(() => {
     if (!loaded || authStatus !== "app" || !workspaceOwnerId) return;
 
+    const gate = canSaveNow();
+    if (!gate.ok) {
+      console.error("[ProSkill] ⛔ Save blocked:", gate.reason);
+      setSyncStatus("error");
+      return;
+    }
+    rememberGoodCounts();
+
     const dataToSave = {
       services, sales, sConf, stockRows, guides, checklist, customers, logs,
       dark, comments, expenses, tasks, bundles, feedback, waTemplates, team,
       dismissedN, seenN, suppliers, adobeAccounts, adobeRentals, saleIntakes,
     };
 
-    // 1. ALWAYS write to localStorage immediately so data is never lost
+    // Write to localStorage. Strip the heavy payloads first: a backup fat with
+    // base64 blows the quota, the write starts failing, and the copy silently
+    // freezes at an old date — which is how stale data gets promoted later.
     try {
       localStorage.setItem("ps_backup_" + workspaceOwnerId, JSON.stringify({
-        data: dataToSave,
+        data: sb.stripHeavyPayload(dataToSave),
         savedAt: new Date().toISOString(),
       }));
-    } catch {}
+    } catch (e) {
+      console.error("[ProSkill] ⚠️ Local backup write FAILED (storage full?):", e && e.name);
+      // A stale backup is worse than none: it can be restored later and pushed
+      // over newer cloud data. Drop it rather than leave a frozen copy behind.
+      try { localStorage.removeItem("ps_backup_" + workspaceOwnerId); } catch {}
+    }
 
     // 2. Queue latest data for cloud save
     pendingData = dataToSave;
@@ -1411,6 +1521,7 @@ export default function App() {
   // ═══ Retry failed saves periodically ═══
   useEffect(() => {
     if (syncStatus !== "error" || !loaded || !workspaceOwnerId) return;
+    if (!canSaveNow().ok) return; // never retry a save that is blocked on purpose
     const retry = setTimeout(() => {
       if (pendingData && !saveInFlight) {
         saveInFlight = true;
@@ -3155,6 +3266,9 @@ export default function App() {
       if (e.key === "s" && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
         if (workspaceOwnerId && !saveInFlight) {
+          const gate = canSaveNow();
+          if (!gate.ok) { alert("⚠️ Save blocked\n\n" + gate.reason); return; }
+          rememberGoodCounts();
           setSyncStatus("saving");
           saveInFlight = true;
           const dataToSave = {
@@ -3836,8 +3950,12 @@ export default function App() {
   };
   const mobileNavTabs = pickMobileNavTabs();
 
+  const saveBlocked = syncStatus === "error" && !canSaveNow().ok;
   const syncColor = syncStatus === "saved" ? t.success : syncStatus === "saving" ? t.warning : t.danger;
-  const syncLabel = syncStatus === "saved" ? "☁️ Synced" : syncStatus === "saving" ? "Saving..." : "⚠️ Will retry";
+  const syncLabel = syncStatus === "saved" ? "☁️ Synced"
+    : syncStatus === "saving" ? "Saving..."
+    : saveBlocked ? "🛑 Saving OFF — reload"
+    : "⚠️ Will retry";
 
   // ═══ Warn user if they try to close tab while saves are pending ═══
   useEffect(() => {
@@ -3855,6 +3973,11 @@ export default function App() {
   // Force-save on demand (manual retry)
   const forceSyncNow = useCallback(async () => {
     if (!workspaceOwnerId || saveInFlight) return;
+    // Same guards as the autosave. This button is reachable exactly when a load
+    // has failed, so without them one tap would push the empty state to the cloud.
+    const gate = canSaveNow();
+    if (!gate.ok) { alert("⚠️ Sync blocked\n\n" + gate.reason); return; }
+    rememberGoodCounts();
     const dataToSave = {
       services, sales, sConf, stockRows, guides, checklist, customers, logs,
       dark, comments, expenses, tasks, bundles, feedback, waTemplates, team,
@@ -3870,7 +3993,7 @@ export default function App() {
     } finally {
       saveInFlight = false;
     }
-  }, [workspaceOwnerId, services, sales, sConf, stockRows, guides, checklist, customers, logs, dark, comments, expenses, tasks, bundles, feedback, waTemplates, team]);
+  }, [workspaceOwnerId, services, sales, sConf, stockRows, guides, checklist, customers, logs, dark, comments, expenses, tasks, bundles, feedback, waTemplates, team, dismissedN, seenN, suppliers, adobeAccounts, adobeRentals, saleIntakes]);
 
   // ═══════════════════════════════════════════════════════════════════
   // 🟢 APP SHELL — Navigation + Content
@@ -3942,7 +4065,7 @@ export default function App() {
                 background: syncColor,
               }} />
               <span style={{ fontSize: 10, color: syncColor, fontWeight: 600 }}>{syncLabel}</span>
-              {syncStatus === "error" && <span style={{ fontSize: 10, color: "#f59e0b", marginLeft: "auto" }}>Tap to retry</span>}
+              {syncStatus === "error" && !saveBlocked && <span style={{ fontSize: 10, color: "#f59e0b", marginLeft: "auto" }}>Tap to retry</span>}
             </div>
           )}
 
