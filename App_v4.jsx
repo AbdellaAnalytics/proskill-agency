@@ -1047,6 +1047,8 @@ export default function App() {
   const loadSucceededRef = useRef(false);
   // Last known-good collection sizes, used to catch a mass wipe before it saves.
   const lastGoodCountsRef = useRef(null);
+  // True when this session's data came from the device backup, not the cloud.
+  const restoredFromBackupRef = useRef(false);
   const [sConf, setSConf] = useState({});
   const [stockRows, setStockRows] = useState([]);
   const [guides, setGuides] = useState([]);
@@ -1070,6 +1072,12 @@ export default function App() {
   const canSaveNow = () => {
     if (!loadSucceededRef.current) {
       return { ok: false, reason: "The workspace never loaded, so this session holds no data.\nSaving is disabled so your cloud copy is not overwritten.\n\nReload the page and wait for your data to appear." };
+    }
+    // Data restored from this device's backup may be OLDER than what is in the
+    // cloud — the local copy silently stops updating once storage fills up.
+    // Pushing it would overwrite newer work, so it needs an explicit decision.
+    if (restoredFromBackupRef.current) {
+      return { ok: false, reason: "This session was restored from an offline copy on this device, which may be out of date.\n\nSaving is paused so it cannot overwrite newer data in the cloud.\nReload while online to load the real workspace." };
     }
     const prev = lastGoodCountsRef.current;
     if (prev) {
@@ -1294,6 +1302,9 @@ export default function App() {
             if (backup) {
               const parsed = JSON.parse(backup);
               d = parsed.data;
+              restoredFromBackupRef.current = true;
+              console.warn("[ProSkill] ⚠️ Restored from device backup saved at", parsed.savedAt,
+                "— this may be older than the cloud. Saving is paused.");
             }
           } catch {}
         }
@@ -1313,6 +1324,9 @@ export default function App() {
             if (backup) {
               const parsed = JSON.parse(backup);
               d = parsed.data;
+              restoredFromBackupRef.current = true;
+              console.warn("[ProSkill] ⚠️ Restored from device backup saved at", parsed.savedAt,
+                "— this may be older than the cloud. Saving is paused.");
             }
           } catch {}
         }
@@ -1331,6 +1345,9 @@ export default function App() {
             if (backup) {
               const parsed = JSON.parse(backup);
               d = parsed.data;
+              restoredFromBackupRef.current = true;
+              console.warn("[ProSkill] ⚠️ Restored from device backup saved at", parsed.savedAt,
+                "— this may be older than the cloud. Saving is paused.");
             }
           } catch {}
         }
@@ -1361,6 +1378,14 @@ export default function App() {
           "Check your connection and reload the page. Do not enter anything until the data appears."
         );
       }
+    } else if (restoredFromBackupRef.current) {
+      setSyncStatus("error");
+      alert(
+        "⚠️ Showing an offline copy from this device.\n\n" +
+        "The cloud could not be reached, so what you see may be OUT OF DATE.\n" +
+        "Saving is paused so it cannot overwrite newer data.\n\n" +
+        "Reload once you are online to load the real workspace."
+      );
     }
   };
 
@@ -1429,15 +1454,19 @@ export default function App() {
       dismissedN, seenN, suppliers, adobeAccounts, adobeRentals, saleIntakes,
     };
 
-    // Write to localStorage. Never let a failure here pass unnoticed — a full
-    // quota is exactly how the "safety net" silently goes stale.
+    // Write to localStorage. Strip the heavy payloads first: a backup fat with
+    // base64 blows the quota, the write starts failing, and the copy silently
+    // freezes at an old date — which is how stale data gets promoted later.
     try {
       localStorage.setItem("ps_backup_" + workspaceOwnerId, JSON.stringify({
-        data: dataToSave,
+        data: sb.stripHeavyPayload(dataToSave),
         savedAt: new Date().toISOString(),
       }));
     } catch (e) {
       console.error("[ProSkill] ⚠️ Local backup write FAILED (storage full?):", e && e.name);
+      // A stale backup is worse than none: it can be restored later and pushed
+      // over newer cloud data. Drop it rather than leave a frozen copy behind.
+      try { localStorage.removeItem("ps_backup_" + workspaceOwnerId); } catch {}
     }
 
     // 2. Queue latest data for cloud save
