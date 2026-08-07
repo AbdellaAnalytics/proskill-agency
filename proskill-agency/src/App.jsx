@@ -5341,13 +5341,17 @@ export default function App() {
                                   }}
                                   style={{ ...t.input, borderColor: item.period_months == null ? t.danger : undefined }}
                                 >
+                                  {/* PERIODS — the same list the manual sale form
+                                      uses, not a second one written by hand.
+                                      That copy stopped at 12 months, so an
+                                      18-month subscription could not be entered
+                                      here at all even though it can be sold and
+                                      recorded everywhere else in the app. One
+                                      list means it cannot drift again. */}
                                   <option value="">— not set —</option>
-                                  <option value={0}>One-time</option>
-                                  <option value={1}>1 month</option>
-                                  <option value={2}>2 months</option>
-                                  <option value={3}>3 months</option>
-                                  <option value={6}>6 months</option>
-                                  <option value={12}>12 months</option>
+                                  {PERIODS.map(pm => (
+                                    <option key={pm} value={pm}>{PERIOD_LABEL(pm)}</option>
+                                  ))}
                                   <option value={-1}>Lifetime</option>
                                 </select>
                               </div>
