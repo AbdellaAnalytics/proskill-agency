@@ -89,63 +89,6 @@ const sb = {
     // Comes back relative, e.g. "/object/sign/bucket/path?token=..."
     return { ok: true, url: rel.startsWith("http") ? rel : SUPABASE_URL + "/storage/v1" + rel };
   },
-  // ═══ Daily snapshots ═══
-  // The live workspace is one row. Without dated copies, any bad write is final.
-  async writeSnapshot(workspaceOwnerId, workspaceKey, data) {
-    try {
-      const slim = this.stripHeavyPayload(data);
-      const d = new Date();
-      const day = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0")
-        + "-" + String(d.getDate()).padStart(2, "0");
-      const row = {
-        workspace_key: workspaceKey,
-        owner_id: workspaceOwnerId,
-        snapshot_day: day,
-        data: slim,
-        sales_count: Array.isArray(slim.sales) ? slim.sales.length : null,
-      };
-      // Upsert on (workspace_key, snapshot_day) so each day holds the latest state.
-      const r = await this.req(
-        "/rest/v1/proskill_snapshots?on_conflict=workspace_key,snapshot_day",
-        {
-          method: "POST",
-          prefer: "resolution=merge-duplicates,return=minimal",
-          body: JSON.stringify(row),
-        }
-      );
-      if (!r.ok) {
-        console.warn("[ProSkill] snapshot write failed:", r.status, r.data);
-        return { ok: false };
-      }
-      // Keep 14 days. Pruning is best-effort; a failure here is harmless.
-      const cutoff = new Date(Date.now() - 14 * 864e5);
-      const cutStr = cutoff.getFullYear() + "-" + String(cutoff.getMonth() + 1).padStart(2, "0")
-        + "-" + String(cutoff.getDate()).padStart(2, "0");
-      this.req(
-        "/rest/v1/proskill_snapshots?workspace_key=eq." + encodeURIComponent(workspaceKey)
-        + "&snapshot_day=lt." + cutStr,
-        { method: "DELETE", prefer: "return=minimal" }
-      ).catch(() => {});
-      console.log("[ProSkill] 🗄️ Snapshot saved for " + day);
-      return { ok: true, day };
-    } catch (e) {
-      console.warn("[ProSkill] snapshot exception:", e && e.message);
-      return { ok: false };
-    }
-  },
-  async listSnapshots(workspaceKey) {
-    const r = await this.req(
-      "/rest/v1/proskill_snapshots?workspace_key=eq." + encodeURIComponent(workspaceKey)
-      + "&select=id,snapshot_day,sales_count,created_at&order=snapshot_day.desc"
-    );
-    return r.ok && Array.isArray(r.data) ? r.data : [];
-  },
-  async fetchSnapshot(id) {
-    const r = await this.req("/rest/v1/proskill_snapshots?id=eq." + id + "&select=data&limit=1");
-    if (r.ok && Array.isArray(r.data) && r.data.length > 0) return r.data[0].data;
-    return null;
-  },
-
   async signUp(email, password) {
     const r = await this.req("/auth/v1/signup", { method: "POST", body: JSON.stringify({ email, password }) });
     if (r.ok && r.data && r.data.access_token) {
@@ -1106,10 +1049,6 @@ export default function App() {
   const lastGoodCountsRef = useRef(null);
   // True when this session's data came from the device backup, not the cloud.
   const restoredFromBackupRef = useRef(false);
-  // True when a row WAS returned but its contents were not a usable workspace.
-  const rejectedRecordRef = useRef(false);
-  // Which day a snapshot was already taken for, so we write one per day.
-  const snapshotDayRef = useRef(null);
   const [sConf, setSConf] = useState({});
   const [stockRows, setStockRows] = useState([]);
   const [guides, setGuides] = useState([]);
@@ -1224,8 +1163,6 @@ export default function App() {
   const [proofModal, setProofModal] = useState(null);
   const [refundModal, setRefundModal] = useState(null);
   const [showBackup, setShowBackup] = useState(false);
-  const [snapshots, setSnapshots] = useState(null);
-  const [snapLoading, setSnapLoading] = useState(false);
   const [showTemplates, setShowTemplates] = useState(null);
   const [editTemplate, setEditTemplate] = useState(null);
   // ─── Adobe Tracker (internal DB, not Google Sheet) ───
@@ -1243,6 +1180,12 @@ export default function App() {
   const [partialPayModal, setPartialPayModal] = useState(null);
   // ─── Sale Intake (Gemini AI extraction from WhatsApp screenshots) ───
   const [saleIntakes, setSaleIntakes] = useState([]); // Array of intake objects
+  // Paid orders pushed here by the store. A plain table, NOT part of the
+  // workspace blob — the store must never read-modify-write that, or a save
+  // from this browser and one from the server would overwrite each other.
+  const [storeInbox, setStoreInbox] = useState([]);
+  const [storeInboxErr, setStoreInboxErr] = useState(null);
+  const [storeBusy, setStoreBusy] = useState(null);
   const [intakeSubTab, setIntakeSubTab] = useState("new"); // new | pending | history
   const [intakeMode, setIntakeMode] = useState("new_sale"); // new_sale | payment_on_existing
   const [intakeImages, setIntakeImages] = useState([]); // [{name, mimeType, base64, sha256}]
@@ -1429,7 +1372,7 @@ export default function App() {
       // sb.lastLoadOk true means the request succeeded and there simply is no
       // workspace row yet — a first run. That must be allowed to save, otherwise
       // a new account could never store anything.
-      if (sb.lastLoadOk && !rejectedRecordRef.current) {
+      if (sb.lastLoadOk) {
         loadSucceededRef.current = true;
         console.log("[ProSkill] No workspace found — starting a fresh one.");
       } else {
@@ -1462,10 +1405,6 @@ export default function App() {
   const applyLoadedData = (d) => {
     if (!d) return;
     if (!looksLikeWorkspace(d)) {
-      // A row came back but its contents are unrecognisable. This must NOT be
-      // confused with "no workspace yet" — that would authorise saving empty
-      // state straight over whatever is actually in that row.
-      rejectedRecordRef.current = true;
       console.error("[ProSkill] ⛔ Loaded record has no recognisable data — treating as a failed load.", d);
       return; // leaves loadSucceededRef false, so saving stays blocked
     }
@@ -1555,14 +1494,6 @@ export default function App() {
           const r = await sb.saveData(workspaceOwnerId, snapshot, ADMIN_EMAIL);
           if (r.ok) {
             if (!pendingData) setSyncStatus("saved");
-            // Once a day, keep a dated copy. Only after a confirmed save, so a
-            // snapshot can never capture a state the cloud rejected.
-            const today = todayStr();
-            if (snapshotDayRef.current !== today) {
-              snapshotDayRef.current = today;
-              sb.writeSnapshot(workspaceOwnerId, "ws_" + workspaceOwnerId, snapshot)
-                .catch(() => { snapshotDayRef.current = null; });
-            }
           } else {
             setSyncStatus("error");
             if (!pendingData) pendingData = snapshot;
@@ -2512,6 +2443,130 @@ export default function App() {
       approvingRef.current = false;
     }
   };
+  // ── Store sales inbox ─────────────────────────────────────────────────────
+  const loadStoreInbox = useCallback(async () => {
+    const r = await sb.req(
+      "/rest/v1/store_sale_inbox?status=eq.pending&select=*&order=created_at.desc&limit=100"
+    );
+    if (!r.ok) {
+      // 404 means the table isn't there yet — that is "not set up", not "broken".
+      setStoreInboxErr(r.status === 404
+        ? "Run store_sale_inbox.sql on this project first."
+        : "Couldn't read the store inbox (" + r.status + ")");
+      setStoreInbox([]);
+      return;
+    }
+    setStoreInboxErr(null);
+    setStoreInbox(Array.isArray(r.data) ? r.data : []);
+  }, []);
+
+  useEffect(() => { if (tab === "saleIntake") loadStoreInbox(); }, [tab, loadStoreInbox]);
+
+  // Turn one store order into a pending intake, then let the existing review
+  // screen do the rest.
+  const importStoreOrder = async (row) => {
+    if (storeBusy) return;
+    setStoreBusy(row.order_number);
+    try {
+      // Match the store's product name to a service by name. A miss is left as
+      // the raw name rather than guessed at — the review screen is where it
+      // gets corrected, and a wrong service silently books revenue to the
+      // wrong line.
+      const wanted = String(row.product_name || "").toLowerCase();
+      const hit = services.find(s => {
+        const n = String(s.name || "").toLowerCase();
+        return n && (n === wanted || wanted.includes(n) || n.includes(wanted));
+      });
+
+      const total = Number(row.price_usd) || 0;
+      const qty = Number(row.quantity) > 0 ? Number(row.quantity) : 1;
+
+      const intake = {
+        id: Date.now(),
+        status: "pending",
+        mode: "new_sale",
+        images: [],
+        chat: [],
+        source: "store",
+        storeOrderNumber: row.order_number,
+        fields: {
+          customer: {
+            name: row.customer_name || row.customer_email || "(no name)",
+            phone: row.customer_phone || "",
+            email: row.customer_email || "",
+          },
+          items: [{
+            service: hit ? hit.name : (row.product_name || ""),
+            qty,
+            unit_price: qty > 0 ? Number((total / qty).toFixed(2)) : total,
+            // NULL on purpose. The store does not know the subscription length,
+            // and the approve step refuses to guess it because a wrong period
+            // corrupts every renewal date that follows. Picked at review.
+            period_months: null,
+            currency: "USD",
+          }],
+          totals: { total, currency: "USD" },
+          // Already paid — the store only queues an order after the money
+          // landed. The order number doubles as the payment reference.
+          payments: [{
+            amount: total,
+            reference: row.order_number,
+            method_hint: row.payment_method || "store",
+          }],
+        },
+        createdBy: "store",
+        createdAt: new Date().toISOString(),
+      };
+      intake.extracted = JSON.parse(JSON.stringify(intake.fields));
+
+      // Claim it in the DATABASE, and only proceed if this call is the one that
+      // won.
+      //
+      // status=eq.pending is what makes it a claim rather than a write: the
+      // second attempt matches no row and comes back empty. The storeBusy flag
+      // above cannot do this job — React state is asynchronous, so two fast
+      // clicks both read it as free, and two tabs never share it at all. Both
+      // would have created a second intake for the same paid order, and it is
+      // the duplicate that reaches the sales list.
+      const upd = await sb.req(
+        "/rest/v1/store_sale_inbox?order_number=eq." + encodeURIComponent(row.order_number)
+          + "&status=eq.pending",
+        {
+          method: "PATCH",
+          prefer: "return=representation",
+          body: JSON.stringify({ status: "approved", handled_at: new Date().toISOString() }),
+        }
+      );
+      if (!upd.ok) {
+        alert("Couldn't claim this order (" + upd.status + "). Nothing was imported.");
+        return;
+      }
+      if (!Array.isArray(upd.data) || upd.data.length === 0) {
+        alert("Order " + row.order_number + " was already handled somewhere else.\n\nNothing was imported.");
+        setStoreInbox(p => p.filter(x => x.order_number !== row.order_number));
+        return;
+      }
+
+      setSaleIntakes(p => [intake, ...p]);
+      setStoreInbox(p => p.filter(x => x.order_number !== row.order_number));
+      addLog("🛒 Store order " + row.order_number + " → intake #" + intake.id);
+    } finally {
+      setStoreBusy(null);
+    }
+  };
+
+  const ignoreStoreOrder = async (row) => {
+    if (!confirm("Ignore store order " + row.order_number + "?\n\nIt stays in the store, it just won't be recorded here.")) return;
+    const upd = await sb.req(
+      "/rest/v1/store_sale_inbox?order_number=eq." + encodeURIComponent(row.order_number)
+        + "&status=eq.pending",
+      { method: "PATCH", prefer: "return=minimal",
+        body: JSON.stringify({ status: "ignored", handled_at: new Date().toISOString() }) }
+    );
+    if (!upd.ok) { alert("Couldn't update (" + upd.status + ")"); return; }
+    setStoreInbox(p => p.filter(x => x.order_number !== row.order_number));
+  };
+
   const approveIntakeInner = (intake) => {
     const f = intake.fields || {};
     if (intake.mode === "new_sale") {
@@ -5950,70 +6005,6 @@ export default function App() {
                 </p>
                 <button onClick={backupAll} style={{ ...t.btnPrimary, width: "100%" }}>💾 Download Backup Now</button>
               </div>
-
-              {/* Automatic daily snapshots */}
-              <div style={{
-                padding: 16,
-                background: t.dark ? "#052e16" : "#f0fdf4",
-                borderRadius: 10, marginBottom: 12,
-                borderLeft: "3px solid " + t.success,
-              }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                  <h4 style={{ margin: 0, fontSize: t.fs.md, color: t.success }}>🗄️ Daily Cloud Snapshots</h4>
-                  <button
-                    onClick={async () => {
-                      setSnapLoading(true);
-                      const list = await sb.listSnapshots("ws_" + workspaceOwnerId);
-                      setSnapshots(list);
-                      setSnapLoading(false);
-                    }}
-                    style={{ ...t.btnGhost, padding: "4px 12px", fontSize: t.fs.xs, minHeight: 30 }}
-                  >{snapLoading ? "..." : "🔄 Load"}</button>
-                </div>
-                <p style={{ margin: "0 0 10px", fontSize: t.fs.sm, color: t.textMuted }}>
-                  A dated copy is kept automatically once a day, for the last 14 days.
-                </p>
-                {snapshots === null ? (
-                  <p style={{ margin: 0, fontSize: t.fs.xs, color: t.textMuted }}>Press Load to see what is stored.</p>
-                ) : snapshots.length === 0 ? (
-                  <p style={{ margin: 0, fontSize: t.fs.xs, color: t.warning }}>
-                    No snapshots yet. The first one is written on your next save — make sure the SQL for
-                    <code> proskill_snapshots </code> has been run.
-                  </p>
-                ) : snapshots.map(s => (
-                  <div key={s.id} style={{
-                    display: "flex", justifyContent: "space-between", alignItems: "center",
-                    padding: "8px 10px", background: t.cardBg2, borderRadius: 6,
-                    marginBottom: 6, gap: 8, flexWrap: "wrap",
-                  }}>
-                    <div style={{ fontSize: t.fs.sm }}>
-                      <strong>{s.snapshot_day}</strong>
-                      <span style={{ color: t.textMuted, fontSize: t.fs.xs }}>
-                        {" · "}{s.sales_count != null ? s.sales_count + " sales" : "—"}
-                      </span>
-                    </div>
-                    <button
-                      onClick={async () => {
-                        if (!confirm(
-                          "Restore the copy from " + s.snapshot_day + "?\n\n" +
-                          "Everything currently in the app is replaced by that day's data.\n" +
-                          "Anything entered since then is lost.\n\n" +
-                          "Download a backup first if you are unsure."
-                        )) return;
-                        const typed = prompt("Type RESTORE to confirm:");
-                        if (typed !== "RESTORE") { alert("Cancelled."); return; }
-                        const data = await sb.fetchSnapshot(s.id);
-                        if (!data) { alert("Could not read that snapshot."); return; }
-                        applyLoadedData(data);
-                        addLog("🗄️ Restored snapshot from " + s.snapshot_day);
-                        alert("✅ Restored " + s.snapshot_day + ".\n\nCheck your Sales list, then reload the page.");
-                        setShowBackup(false);
-                      }}
-                      style={{ ...t.btnGhost, padding: "4px 12px", fontSize: t.fs.xs, minHeight: 30, color: t.warning, borderColor: t.warning }}
-                    >↺ Restore</button>
-                  </div>
-                ))}
-              </div>
               <div style={{
                 padding: 16,
                 background: t.dark ? "#422006" : "#fffbeb",
@@ -8481,6 +8472,67 @@ export default function App() {
                 <h2 style={{ margin: 0, fontSize: t.fs.xl, fontWeight: 800 }}>🧾 Sale Intake (AI)</h2>
                 <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>Powered by Gemini</div>
               </div>
+
+              {/* Orders paid on the website, waiting to be brought in. Importing
+                  turns one into a normal pending intake below — same review,
+                  same checks, same approve button as everything else here. */}
+              {/* Always rendered. Hidden when empty, the first thing you see
+                  after installing this is no change at all — and there is no way
+                  to tell "no orders waiting" from "it didn't install". */}
+              {(
+                <div style={{ marginBottom: 18, padding: 14, borderRadius: 10,
+                              background: t.card, border: "1px solid " + t.border }}>
+                  <div style={{ display: "flex", justifyContent: "space-between",
+                                alignItems: "center", marginBottom: 10, gap: 10, flexWrap: "wrap" }}>
+                    <b style={{ fontSize: t.fs.md }}>🛒 Store sales waiting ({storeInbox.length})</b>
+                    <button onClick={loadStoreInbox}
+                            style={{ padding: "5px 10px", borderRadius: 6, cursor: "pointer",
+                                     border: "1px solid " + t.border, background: "transparent",
+                                     color: t.text, fontSize: t.fs.xs }}>↻ Refresh</button>
+                  </div>
+
+                  {storeInboxErr && (
+                    <div style={{ fontSize: t.fs.xs, color: "#f59e0b" }}>{storeInboxErr}</div>
+                  )}
+                  {!storeInboxErr && storeInbox.length === 0 && (
+                    <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>
+                      No store sales waiting. Paid website orders appear here automatically.
+                    </div>
+                  )}
+
+                  {storeInbox.map(row => (
+                    <div key={row.order_number}
+                         style={{ display: "flex", justifyContent: "space-between", gap: 10,
+                                  alignItems: "center", flexWrap: "wrap",
+                                  padding: "9px 0", borderTop: "1px solid " + t.border }}>
+                      <div style={{ minWidth: 200 }}>
+                        <div style={{ fontWeight: 700, fontSize: t.fs.sm }}>
+                          {row.product_name || "—"}
+                          <span style={{ color: t.textMuted, fontWeight: 400 }}>
+                            {" "}× {row.quantity || 1}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>
+                          {row.customer_name || row.customer_email || "—"} · ${Number(row.price_usd || 0).toFixed(2)} · {row.order_number}
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button onClick={() => importStoreOrder(row)}
+                                disabled={storeBusy === row.order_number || !canEdit}
+                                style={{ padding: "6px 12px", borderRadius: 6, border: "none",
+                                         background: t.primary, color: "#fff", fontWeight: 700,
+                                         fontSize: t.fs.xs, cursor: "pointer" }}>
+                          {storeBusy === row.order_number ? "…" : "Import"}
+                        </button>
+                        <button onClick={() => ignoreStoreOrder(row)} disabled={!canEdit}
+                                style={{ padding: "6px 10px", borderRadius: 6, cursor: "pointer",
+                                         border: "1px solid " + t.border, background: "transparent",
+                                         color: t.textMuted, fontSize: t.fs.xs }}>Ignore</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
 
               {/* Sub-tabs */}
               <div style={{ display: "flex", gap: 4, marginBottom: 14, borderBottom: "1px solid " + t.border, overflowX: "auto" }}>
