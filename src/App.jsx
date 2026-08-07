@@ -2496,6 +2496,17 @@ export default function App() {
             email: row.customer_email || "",
           },
           items: [{
+            // catalog_product_id and raw_text — NOT "service".
+            //
+            // "service" is the field name the sale ends up with, but the approve
+            // step never reads it: it takes catalog_product_id (the dropdown's
+            // value, prefixed svc_) and falls back to raw_text. Filling in
+            // "service" meant every import arrived with the picker empty and had
+            // to be set by hand — and worse, approving without touching it falls
+            // back to svcNames[0], booking the sale against whatever service
+            // happens to be first in the list.
+            catalog_product_id: hit ? "svc_" + hit.name : "",
+            raw_text: row.product_name || "",
             service: hit ? hit.name : (row.product_name || ""),
             qty,
             unit_price: qty > 0 ? Number((total / qty).toFixed(2)) : total,
@@ -2583,6 +2594,25 @@ export default function App() {
       const badPrice = (f.items || []).findIndex(x => !(Number(x.unit_price) > 0));
       if (badPrice >= 0) {
         alert("Item " + (badPrice + 1) + " has no unit price. Fill it in before approving.");
+        return;
+      }
+      // Same rule as the period and the price above, for the same reason.
+      //
+      // Without this the line builder falls back to svcNames[0] — the first
+      // service in the list, unrelated to whatever was sold — and says nothing.
+      // The sale that comes out looks exactly like a correct one, so the error
+      // is invisible today and unfindable later: revenue by service, commission
+      // and the renewal date all follow the service, and there is no way to tell
+      // afterwards which sales were guessed.
+      const badService = (f.items || []).findIndex(x => {
+        const picked = String(x.catalog_product_id || "");
+        if (picked.startsWith("svc_") && svcNames.includes(picked.slice(4))) return false;
+        // A raw name that exactly matches a service is a real match, not a guess.
+        const raw = String(x.raw_text || "").trim().toLowerCase();
+        return !svcNames.some(sv => sv.toLowerCase() === raw);
+      });
+      if (badService >= 0) {
+        alert("Item " + (badService + 1) + " has no service selected.\n\nPick one from the \"Match to product\" list before approving.\n\nApproving without it would file this sale under \"" + (svcNames[0] || "?") + "\" — that is simply the first service in your list, not what was sold.");
         return;
       }
       // Duplicate-sale guard: same customer + same total + same day already open?
