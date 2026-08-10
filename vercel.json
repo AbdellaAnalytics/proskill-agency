@@ -1,0 +1,35 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "crons": [
+    {
+      "path": "/cron/vendor-costs",
+      "schedule": "0 5 * * *"
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/cron/vendor-costs",
+      "destination": "/api/admin?action=vendor-costs"
+    },
+    {
+      "source": "/sitemap.xml",
+      "destination": "/api/sitemap"
+    },
+    {
+      "source": "/p/:slug",
+      "destination": "/api/meta?type=p&slug=:slug"
+    },
+    {
+      "source": "/c/:slug",
+      "destination": "/api/meta?type=c&slug=:slug"
+    },
+    {
+      "source": "/cv",
+      "destination": "/api/meta?type=cv"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}

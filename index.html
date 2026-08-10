@@ -1,37 +1,72 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html lang="ar" dir="rtl">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-    <meta name="theme-color" content="#2a9d8f" />
-    <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <meta name="mobile-web-app-capable" content="yes" />
-
-    <!-- Favicon -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="apple-touch-icon" href="/favicon.svg" />
+    <meta name="theme-color" content="#fbfbfa" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0b1620" media="(prefers-color-scheme: dark)" />
 
-    <!-- Page title + description -->
-    <title>ProSkill Agency — Digital Agency Management Platform</title>
-    <meta name="description" content="ProSkill Agency — manage software subscriptions, track sales, customers, renewals, and team commissions all in one place." />
+    <title>ProSkill Store — اشتراكات رقمية أصلية بتسليم فوري</title>
+    <meta name="description" content="اشترِ اشتراكات ChatGPT Plus وAdobe وNetflix وCanva وGemini بأفضل الأسعار في مصر. تسليم فوري، ضمان حقيقي، ودفع آمن. متجر ProSkill Digital Agency." />
+    <meta name="keywords" content="شراء اشتراك ChatGPT, اشتراك Adobe مصر, Netflix اشتراك رخيص, Canva Pro, Gemini Pro, اشتراكات رقمية, ProSkill" />
+    <link rel="canonical" href="https://store.proskillagency.com/" />
 
-    <!-- Open Graph (WhatsApp, Facebook, LinkedIn) -->
-    <meta property="og:title" content="ProSkill Agency" />
-    <meta property="og:description" content="Digital Agency Management Platform — manage subscriptions, sales, customers and team commissions." />
-    <meta property="og:image" content="/og-image.svg" />
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="ProSkill Store" />
+    <meta property="og:title" content="ProSkill Store — اشتراكات رقمية أصلية بتسليم فوري" />
+    <meta property="og:description" content="أكواد وحسابات أصلية بأفضل الأسعار. تسليم فوري وضمان حقيقي." />
+    <meta property="og:url" content="https://store.proskillagency.com/" />
+    <meta property="og:image" content="https://store.proskillagency.com/og-default.png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:type" content="website" />
-    <meta property="og:url" content="https://proskill-agency.vercel.app/" />
-    <meta property="og:site_name" content="ProSkill Agency" />
-
-    <!-- Twitter Card -->
+    <meta property="og:locale" content="ar_EG" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="ProSkill Agency" />
-    <meta name="twitter:description" content="Digital Agency Management Platform" />
-    <meta name="twitter:image" content="/og-image.svg" />
+    <meta name="twitter:title" content="ProSkill Store — اشتراكات رقمية أصلية بتسليم فوري" />
+    <meta name="twitter:image" content="https://store.proskillagency.com/og-default.png" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <!-- Fonts must not block the first paint.
+         A stylesheet link is render-blocking: the browser downloads the CSS,
+         then the font files, and shows nothing until it's done — a round trip
+         to Google's servers before a single pixel appears. Loading it as a
+         print stylesheet takes it off the critical path, then switching the
+         media to all once it arrives applies it. The <noscript> keeps it
+         working with JavaScript disabled.
+         Every weight requested here is used in the stylesheet; none is waste. -->
+    <link
+      href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+      media="print"
+      onload="this.media='all'"
+    />
+    <noscript>
+      <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    </noscript>
+  
+    <!-- Who this shop is, in plain machine-readable form.
+         Search crawlers run the app and can work it out; the crawlers behind
+         AI assistants generally do not run JavaScript, so for them this block
+         is the only description of the business that exists. -->
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "OnlineStore", "name": "ProSkill Store", "alternateName": "متجر ProSkill", "url": "https://store.proskillagency.com", "description": "متجر مصري لبيع الاشتراكات الرقمية الأصلية بتسليم فوري وضمان، وخدمة إعداد سيرة ذاتية متوافقة مع أنظمة ATS بالذكاء الاصطناعي.", "areaServed": {"@type": "Country", "name": "Egypt"}, "currenciesAccepted": "USD, EGP", "paymentAccepted": "Credit Card, Mobile Wallet, Fawry, InstaPay", "contactPoint": {"@type": "ContactPoint", "contactType": "customer support", "telephone": "+201500568788", "availableLanguage": ["Arabic", "English"]}}</script>
   </head>
+  <script>
+      // Apply the saved theme before first paint (prevents a flash).
+      (function () {
+        try {
+          var t = localStorage.getItem('ps_theme');
+          if (!t) t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+          var l = localStorage.getItem('ps_lang') || 'ar';
+          var h = document.documentElement;
+          h.setAttribute('data-theme', t);
+          h.setAttribute('lang', l);
+          h.setAttribute('dir', l === 'ar' ? 'rtl' : 'ltr');
+        } catch (e) {}
+      })();
+    </script>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
