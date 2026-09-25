@@ -360,6 +360,7 @@ const sb = {
 // ═══════════════════════════════════════════════════════════════════
 const ADMIN_EMAIL = "Mohamed.abdullah969@gmail.com";
 const ADMIN_WA = "201270935507";
+const BUILD_TAG = "v5 · 25 Sep";  // shown under the logo so it is obvious which build is live
 // LinkedIn brand blue — used so its alerts stand apart from the amber/red ones.
 const LI_BLUE = "#0a66c2";
 // Any service whose name mentions LinkedIn counts, so "LinkedIn verification"
@@ -4304,6 +4305,7 @@ export default function App() {
               <div>
                 <div style={{ fontWeight: 700, fontSize: 14 }}>ProSkill</div>
                 <div style={{ fontSize: 8, color: "#2a9d8f", fontWeight: 600, letterSpacing: 1.5 }}>DIGITAL AGENCY</div>
+                <div style={{ fontSize: 8, color: "#f59e0b", fontWeight: 700 }}>{BUILD_TAG}</div>
               </div>
             )}
           </div>
