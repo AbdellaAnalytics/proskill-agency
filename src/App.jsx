@@ -360,7 +360,7 @@ const sb = {
 // ═══════════════════════════════════════════════════════════════════
 const ADMIN_EMAIL = "Mohamed.abdullah969@gmail.com";
 const ADMIN_WA = "201270935507";
-const BUILD_TAG = "v5 · 25 Sep";  // shown under the logo so it is obvious which build is live
+const BUILD_TAG = "v6 · 25 Sep";  // shown under the logo so it is obvious which build is live
 // LinkedIn brand blue — used so its alerts stand apart from the amber/red ones.
 const LI_BLUE = "#0a66c2";
 // Any service whose name mentions LinkedIn counts, so "LinkedIn verification"
@@ -1262,6 +1262,12 @@ export default function App() {
   const [partialPayModal, setPartialPayModal] = useState(null);
   // ─── Sale Intake (Gemini AI extraction from WhatsApp screenshots) ───
   const [saleIntakes, setSaleIntakes] = useState([]); // Array of intake objects
+  // Paid orders pushed here by the store. A plain table, NOT part of the
+  // workspace blob — the store must never read-modify-write that, or a save
+  // from this browser and one from the server would overwrite each other.
+  const [storeInbox, setStoreInbox] = useState([]);
+  const [storeInboxErr, setStoreInboxErr] = useState(null);
+  const [storeBusy, setStoreBusy] = useState(null);
   const [intakeSubTab, setIntakeSubTab] = useState("new"); // new | pending | history
   const [intakeMode, setIntakeMode] = useState("new_sale"); // new_sale | payment_on_existing
   const [intakeImages, setIntakeImages] = useState([]); // [{name, mimeType, base64, sha256}]
@@ -2566,6 +2572,142 @@ export default function App() {
       approvingRef.current = false;
     }
   };
+  // ── Store sales inbox ─────────────────────────────────────────────────────
+  const loadStoreInbox = useCallback(async () => {
+    const r = await sb.req(
+      "/rest/v1/store_sale_inbox?status=eq.pending&select=*&order=created_at.desc&limit=100"
+    );
+    if (!r.ok) {
+      // 404 means the table isn't there yet — that is "not set up", not "broken".
+      setStoreInboxErr(r.status === 404
+        ? "Run store_sale_inbox.sql on this project first."
+        : "Couldn't read the store inbox (" + r.status + ")");
+      setStoreInbox([]);
+      return;
+    }
+    setStoreInboxErr(null);
+    setStoreInbox(Array.isArray(r.data) ? r.data : []);
+  }, []);
+
+  useEffect(() => { if (tab === "saleIntake") loadStoreInbox(); }, [tab, loadStoreInbox]);
+
+  // Turn one store order into a pending intake, then let the existing review
+  // screen do the rest.
+  const importStoreOrder = async (row) => {
+    if (storeBusy) return;
+    setStoreBusy(row.order_number);
+    try {
+      // Match the store's product name to a service by name. A miss is left as
+      // the raw name rather than guessed at — the review screen is where it
+      // gets corrected, and a wrong service silently books revenue to the
+      // wrong line.
+      const wanted = String(row.product_name || "").toLowerCase();
+      const hit = services.find(s => {
+        const n = String(s.name || "").toLowerCase();
+        return n && (n === wanted || wanted.includes(n) || n.includes(wanted));
+      });
+
+      const total = Number(row.price_usd) || 0;
+      const qty = Number(row.quantity) > 0 ? Number(row.quantity) : 1;
+
+      const intake = {
+        id: Date.now(),
+        status: "pending",
+        mode: "new_sale",
+        images: [],
+        chat: [],
+        source: "store",
+        storeOrderNumber: row.order_number,
+        fields: {
+          customer: {
+            name: row.customer_name || row.customer_email || "(no name)",
+            phone: row.customer_phone || "",
+            email: row.customer_email || "",
+          },
+          items: [{
+            // catalog_product_id and raw_text — NOT "service".
+            //
+            // "service" is the field name the sale ends up with, but the approve
+            // step never reads it: it takes catalog_product_id (the dropdown's
+            // value, prefixed svc_) and falls back to raw_text. Filling in
+            // "service" meant every import arrived with the picker empty and had
+            // to be set by hand — and worse, approving without touching it falls
+            // back to svcNames[0], booking the sale against whatever service
+            // happens to be first in the list.
+            catalog_product_id: hit ? "svc_" + hit.name : "",
+            raw_text: row.product_name || "",
+            service: hit ? hit.name : (row.product_name || ""),
+            qty,
+            unit_price: qty > 0 ? Number((total / qty).toFixed(2)) : total,
+            // NULL on purpose. The store does not know the subscription length,
+            // and the approve step refuses to guess it because a wrong period
+            // corrupts every renewal date that follows. Picked at review.
+            period_months: null,
+            currency: "USD",
+          }],
+          totals: { total, currency: "USD" },
+          // Already paid — the store only queues an order after the money
+          // landed. The order number doubles as the payment reference.
+          payments: [{
+            amount: total,
+            reference: row.order_number,
+            method_hint: row.payment_method || "store",
+          }],
+        },
+        createdBy: "store",
+        createdAt: new Date().toISOString(),
+      };
+      intake.extracted = JSON.parse(JSON.stringify(intake.fields));
+
+      // Claim it in the DATABASE, and only proceed if this call is the one that
+      // won.
+      //
+      // status=eq.pending is what makes it a claim rather than a write: the
+      // second attempt matches no row and comes back empty. The storeBusy flag
+      // above cannot do this job — React state is asynchronous, so two fast
+      // clicks both read it as free, and two tabs never share it at all. Both
+      // would have created a second intake for the same paid order, and it is
+      // the duplicate that reaches the sales list.
+      const upd = await sb.req(
+        "/rest/v1/store_sale_inbox?order_number=eq." + encodeURIComponent(row.order_number)
+          + "&status=eq.pending",
+        {
+          method: "PATCH",
+          prefer: "return=representation",
+          body: JSON.stringify({ status: "approved", handled_at: new Date().toISOString() }),
+        }
+      );
+      if (!upd.ok) {
+        alert("Couldn't claim this order (" + upd.status + "). Nothing was imported.");
+        return;
+      }
+      if (!Array.isArray(upd.data) || upd.data.length === 0) {
+        alert("Order " + row.order_number + " was already handled somewhere else.\n\nNothing was imported.");
+        setStoreInbox(p => p.filter(x => x.order_number !== row.order_number));
+        return;
+      }
+
+      setSaleIntakes(p => [intake, ...p]);
+      setStoreInbox(p => p.filter(x => x.order_number !== row.order_number));
+      addLog("🛒 Store order " + row.order_number + " → intake #" + intake.id);
+    } finally {
+      setStoreBusy(null);
+    }
+  };
+
+  const ignoreStoreOrder = async (row) => {
+    if (!confirm("Ignore store order " + row.order_number + "?\n\nIt stays in the store, it just won't be recorded here.")) return;
+    const upd = await sb.req(
+      "/rest/v1/store_sale_inbox?order_number=eq." + encodeURIComponent(row.order_number)
+        + "&status=eq.pending",
+      { method: "PATCH", prefer: "return=minimal",
+        body: JSON.stringify({ status: "ignored", handled_at: new Date().toISOString() }) }
+    );
+    if (!upd.ok) { alert("Couldn't update (" + upd.status + ")"); return; }
+    setStoreInbox(p => p.filter(x => x.order_number !== row.order_number));
+  };
+
+
   const approveIntakeInner = (intake) => {
     const f = intake.fields || {};
     if (intake.mode === "new_sale") {
@@ -2582,6 +2724,25 @@ export default function App() {
       const badPrice = (f.items || []).findIndex(x => !(Number(x.unit_price) > 0));
       if (badPrice >= 0) {
         alert("Item " + (badPrice + 1) + " has no unit price. Fill it in before approving.");
+        return;
+      }
+      // Same rule as the period and the price above, for the same reason.
+      //
+      // Without this the line builder falls back to svcNames[0] — the first
+      // service in the list, unrelated to whatever was sold — and says nothing.
+      // The sale that comes out looks exactly like a correct one, so the error
+      // is invisible today and unfindable later: revenue by service, commission
+      // and the renewal date all follow the service, and there is no way to tell
+      // afterwards which sales were guessed.
+      const badService = (f.items || []).findIndex(x => {
+        const picked = String(x.catalog_product_id || "");
+        if (picked.startsWith("svc_") && svcNames.includes(picked.slice(4))) return false;
+        // A raw name that exactly matches a service is a real match, not a guess.
+        const raw = String(x.raw_text || "").trim().toLowerCase();
+        return !svcNames.some(sv => sv.toLowerCase() === raw);
+      });
+      if (badService >= 0) {
+        alert("Item " + (badService + 1) + " has no service selected.\n\nPick one from the \"Match to product\" list before approving.\n\nApproving without it would file this sale under \"" + (svcNames[0] || "?") + "\" — that is simply the first service in your list, not what was sold.");
         return;
       }
       // Duplicate-sale guard: same customer + same total + same day already open?
@@ -5448,13 +5609,17 @@ export default function App() {
                                   }}
                                   style={{ ...t.input, borderColor: item.period_months == null ? t.danger : undefined }}
                                 >
+                                  {/* PERIODS — the same list the manual sale form
+                                      uses, not a second one written by hand.
+                                      That copy stopped at 12 months, so an
+                                      18-month subscription could not be entered
+                                      here at all even though it can be sold and
+                                      recorded everywhere else in the app. One
+                                      list means it cannot drift again. */}
                                   <option value="">— not set —</option>
-                                  <option value={0}>One-time</option>
-                                  <option value={1}>1 month</option>
-                                  <option value={2}>2 months</option>
-                                  <option value={3}>3 months</option>
-                                  <option value={6}>6 months</option>
-                                  <option value={12}>12 months</option>
+                                  {PERIODS.map(pm => (
+                                    <option key={pm} value={pm}>{PERIOD_LABEL(pm)}</option>
+                                  ))}
                                   <option value={-1}>Lifetime</option>
                                 </select>
                               </div>
@@ -8687,6 +8852,68 @@ export default function App() {
                 <h2 style={{ margin: 0, fontSize: t.fs.xl, fontWeight: 800 }}>🧾 Sale Intake (AI)</h2>
                 <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>Powered by Gemini</div>
               </div>
+
+              {/* Orders paid on the website, waiting to be brought in. Importing
+                  turns one into a normal pending intake below — same review,
+                  same checks, same approve button as everything else here. */}
+              {/* Always rendered. Hidden when empty, the first thing you see
+                  after installing this is no change at all — and there is no way
+                  to tell "no orders waiting" from "it didn't install". */}
+              {(
+                <div style={{ marginBottom: 18, padding: 14, borderRadius: 10,
+                              background: t.card, border: "1px solid " + t.border }}>
+                  <div style={{ display: "flex", justifyContent: "space-between",
+                                alignItems: "center", marginBottom: 10, gap: 10, flexWrap: "wrap" }}>
+                    <b style={{ fontSize: t.fs.md }}>🛒 Store sales waiting ({storeInbox.length})</b>
+                    <button onClick={loadStoreInbox}
+                            style={{ padding: "5px 10px", borderRadius: 6, cursor: "pointer",
+                                     border: "1px solid " + t.border, background: "transparent",
+                                     color: t.text, fontSize: t.fs.xs }}>↻ Refresh</button>
+                  </div>
+
+                  {storeInboxErr && (
+                    <div style={{ fontSize: t.fs.xs, color: "#f59e0b" }}>{storeInboxErr}</div>
+                  )}
+                  {!storeInboxErr && storeInbox.length === 0 && (
+                    <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>
+                      No store sales waiting. Paid website orders appear here automatically.
+                    </div>
+                  )}
+
+                  {storeInbox.map(row => (
+                    <div key={row.order_number}
+                         style={{ display: "flex", justifyContent: "space-between", gap: 10,
+                                  alignItems: "center", flexWrap: "wrap",
+                                  padding: "9px 0", borderTop: "1px solid " + t.border }}>
+                      <div style={{ minWidth: 200 }}>
+                        <div style={{ fontWeight: 700, fontSize: t.fs.sm }}>
+                          {row.product_name || "—"}
+                          <span style={{ color: t.textMuted, fontWeight: 400 }}>
+                            {" "}× {row.quantity || 1}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>
+                          {row.customer_name || row.customer_email || "—"} · ${Number(row.price_usd || 0).toFixed(2)} · {row.order_number}
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button onClick={() => importStoreOrder(row)}
+                                disabled={storeBusy === row.order_number || !canEdit}
+                                style={{ padding: "6px 12px", borderRadius: 6, border: "none",
+                                         background: t.primary, color: "#fff", fontWeight: 700,
+                                         fontSize: t.fs.xs, cursor: "pointer" }}>
+                          {storeBusy === row.order_number ? "…" : "Import"}
+                        </button>
+                        <button onClick={() => ignoreStoreOrder(row)} disabled={!canEdit}
+                                style={{ padding: "6px 10px", borderRadius: 6, cursor: "pointer",
+                                         border: "1px solid " + t.border, background: "transparent",
+                                         color: t.textMuted, fontSize: t.fs.xs }}>Ignore</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
 
               {/* Sub-tabs */}
               <div style={{ display: "flex", gap: 4, marginBottom: 14, borderBottom: "1px solid " + t.border, overflowX: "auto" }}>
