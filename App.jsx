@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, Fragment } from "react";
 
 // ═══════════════════════════════════════════════════════════════════
 // 📱 VIEWPORT DETECTION HOOK
@@ -360,6 +360,11 @@ const sb = {
 // ═══════════════════════════════════════════════════════════════════
 const ADMIN_EMAIL = "Mohamed.abdullah969@gmail.com";
 const ADMIN_WA = "201270935507";
+// LinkedIn brand blue — used so its alerts stand apart from the amber/red ones.
+const LI_BLUE = "#0a66c2";
+// Any service whose name mentions LinkedIn counts, so "LinkedIn verification"
+// and any future variant are picked up without editing this list.
+const isLinkedInService = (name) => (name || "").toLowerCase().includes("linkedin");
 const COMPANY = {
   name: "ProSkill Digital Agency",
   website: "www.proskillagency.com",
@@ -443,6 +448,7 @@ const MEMBER_TABS = [
   { id: "stock",       label: "📦 Stock",           defaultOn: true  },
   { id: "adobe",       label: "🎨 Adobe",           defaultOn: true  },
   { id: "adobeTracker",label: "🎯 Adobe Tracker",   defaultOn: false },
+  { id: "liTracker",   label: "💼 LinkedIn Tracker", defaultOn: false },
   { id: "saleIntake",  label: "🧾 Sale Intake",      defaultOn: false },
   { id: "renewals",    label: "🔄 Renewals",        defaultOn: true  },
   { id: "suppliers",   label: "🏪 Suppliers",       defaultOn: false },
@@ -466,6 +472,7 @@ const PERM_ACTIONS = [
   { id: "canRefund",       label: "↩️ Issue refunds",                  defaultOn: false },
   { id: "manageSuppliers", label: "🏪 Manage suppliers (debit/credit)", defaultOn: false },
   { id: "adobeTracker",    label: "🎯 Adobe Tracker (accounts/rentals)", defaultOn: false },
+  { id: "liTracker",       label: "💼 LinkedIn Tracker (subscriptions)", defaultOn: false },
   { id: "saleIntake",      label: "🧾 Sale Intake (AI extraction)",     defaultOn: false },
   { id: "viewCommissionAll", label: "💰 See all team's commissions",   defaultOn: false },
 ];
@@ -645,6 +652,11 @@ function dateToStr(d) {
 function addMonths(s, m) {
   const d = new Date(s);
   d.setMonth(d.getMonth() + m);
+  return dateToStr(d);
+}
+function addDays(s, n) {
+  const d = new Date(s);
+  d.setDate(d.getDate() + n);
   return dateToStr(d);
 }
 function daysLeft(s) {
@@ -1174,6 +1186,7 @@ export default function App() {
   const [adobeDateFrom, setAdobeDateFrom] = useState("");
   const [adobeDateTo, setAdobeDateTo] = useState("");
   // Renewals tab (all subscriptions, sorted by renewDate)
+  const [renDueExpanded, setRenDueExpanded] = useState(false);
   const [renSearch, setRenSearch] = useState("");
   const [renFilter, setRenFilter] = useState("all"); // all | overdue | expired | due | upcoming | renewed
   const [renSort, setRenSort] = useState("days"); // days | name | renewDate
@@ -1232,6 +1245,11 @@ export default function App() {
   const [adobeAccounts, setAdobeAccounts] = useState([]); // [{id,email,passEmail,passAdobe,source,note,banned,createdAt,createdBy}]
   const [adobeRentals, setAdobeRentals] = useState([]); // [{id,accountId,saleId,customer,phone,startDate,endDate,planMonths,status,createdAt}]
   const [atSubTab, setAtSubTab] = useState("accounts"); // accounts | active | history
+  // LinkedIn tracker filters
+  const [liSearch, setLiSearch] = useState("");
+  const [liFilter, setLiFilter] = useState("all"); // all | expiring | expired | active | onetime
+  const [liFrom, setLiFrom] = useState("");
+  const [liTo, setLiTo] = useState("");
   const [atAccountSearch, setAtAccountSearch] = useState("");
   const [atAccountFilter, setAtAccountFilter] = useState("all"); // all | available | rented | banned
   const [atActiveSearch, setAtActiveSearch] = useState("");
@@ -2089,6 +2107,13 @@ export default function App() {
   };
 
   const renewSale = (s) => {
+    // Stamp the old sale. Without this it stays "expired" forever: it keeps
+    // showing in the trackers and keeps firing renewal alerts even though the
+    // customer has already renewed. renewedAt is cleared if the new sale is
+    // never actually saved (see the cancel path in the sale form).
+    setSales(p => p.map(x => x.id === s.id
+      ? { ...x, renewedAt: new Date().toISOString(), renewedBy: cU ? cU.name : "?" }
+      : x));
     setNewSale({
       service: s.service,
       customer: s.customer,
@@ -2101,6 +2126,8 @@ export default function App() {
       soldDate: todayStr(),
       notes: "Renewal",
       assignedTo: s.assignedTo || null,
+      vendor: s.vendor || "",
+      renewalOf: s.id,
     });
     setTab("sales_entry");
   };
@@ -3578,27 +3605,120 @@ export default function App() {
   }, [adobeSchedule, adobeDismissedList, adobeSearch, adobeFilter, adobeSort, adobeDateFrom, adobeDateTo]);
 
   // Renewals tab — ALL subscriptions sorted by their renewDate
-  const renewalsList = useMemo(() => {
-    const t0 = todayStr();
+  // ─── LinkedIn subscriptions ───
+  // Read straight off the sales table: a LinkedIn sale already carries period
+  // and renewDate, so there is no second source of truth to keep in sync.
+  const liList = useMemo(() => {
     return scopedSales
-      .filter(a => a.done && a.period > 0 && a.renewDate && !a.refunded)
+      .filter(a => isLinkedInService(a.service) && a.done && !a.refunded)
+      .map(a => {
+        const days = a.renewDate ? daysLeft(a.renewDate) : null;
+        // Already renewed into a follow-on sale — no longer a live subscription
+        const renewed = !!a.renewedAt;
+        // period 0 = one-off (e.g. verification), -1 = lifetime — neither expires
+        const recurring = a.period > 0 && !!a.renewDate && !renewed;
+        let status = "one_time";
+        if (renewed) status = "renewed";
+        else if (a.period === -1) status = "lifetime";
+        else if (recurring) {
+          if (days < 0) status = "expired";
+          else if (days === 0) status = "today";
+          else if (days === 1) status = "tomorrow";
+          else if (days <= 7) status = "soon";
+          else status = "active";
+        }
+        return { ...a, daysUntil: days, recurring, renewed, liStatus: status };
+      })
+      .sort((a, b) => {
+        // Expiring first; non-recurring sink to the bottom
+        const av = a.recurring ? (a.daysUntil ?? 9999) : 99999;
+        const bv = b.recurring ? (b.daysUntil ?? 9999) : 99999;
+        return av - bv;
+      });
+  }, [scopedSales]);
+
+  // ─── Renewals ───
+  // Adobe is deliberately excluded: its renewals happen month-by-month inside a
+  // single sale, which the Adobe tab tracks properly. Mixing it in here showed a
+  // 6-month Adobe sale as one far-off date and hid the monthly work entirely.
+  const renewalsList = useMemo(() => {
+    return scopedSales
+      .filter(a => a.done && a.period > 0 && a.renewDate && !a.refunded
+        && (a.service || "").toLowerCase() !== "adobe")
       .map(a => {
         const days = daysLeft(a.renewDate);
-        const isOverdue = days < 0;
-        const isExpired = days < 0;
-        const needsReminder = days >= 0 && days <= 2;
-        const isUpcoming = days > 2 && days <= 30;
+        const renewed = !!a.renewedAt;
+        // Urgency band drives grouping, colour and the action strip.
+        let band;
+        if (renewed) band = "renewed";
+        else if (days < 0) band = "late";
+        else if (days <= 7) band = "week";
+        else if (days <= 30) band = "month";
+        else band = "later";
         return {
           ...a,
           daysUntil: days,
-          isOverdue,
-          isExpired,
-          needsReminder,
-          isUpcoming,
-          status: a.renewedAt ? "Renewed" : (isOverdue ? "Overdue" : "Pending"),
+          renewed,
+          band,
+          isOverdue: !renewed && days < 0,
+          isExpired: !renewed && days < 0,
+          needsReminder: !renewed && days >= 0 && days <= 2,
+          isUpcoming: !renewed && days > 2 && days <= 30,
+          status: renewed ? "Renewed" : (days < 0 ? "Overdue" : "Pending"),
+          // How much of the term has elapsed, for the little progress bar.
+          pct: (() => {
+            if (renewed) return 100;
+            const total = (a.period || 1) * 30;
+            const used = total - days;
+            return Math.max(0, Math.min(100, Math.round((used / total) * 100)));
+          })(),
         };
       });
   }, [scopedSales]);
+
+  // How many Adobe subscriptions were moved out, so the tab can say where they went.
+  const adobeRenewalCount = useMemo(
+    () => scopedSales.filter(a => a.done && a.period > 0 && a.renewDate && !a.refunded
+      && (a.service || "").toLowerCase() === "adobe" && !a.renewedAt).length,
+    [scopedSales]
+  );
+
+  // Everything that needs a message today: already late, or due within 1 day.
+  const renDueNow = useMemo(
+    () => renewalsList
+      .filter(a => !a.renewed && a.daysUntil <= 1)
+      .sort((x, y) => x.daysUntil - y.daysUntil),
+    [renewalsList]
+  );
+
+  // Band totals in money, not just counts — the number that prompts action.
+  const renStats = useMemo(() => {
+    const sum = (arr) => arr.reduce((s, a) => s + (a.priceEGP || a.price || 0), 0);
+    const late = renewalsList.filter(a => a.band === "late");
+    const week = renewalsList.filter(a => a.band === "week");
+    const month = renewalsList.filter(a => a.band === "month");
+    const later = renewalsList.filter(a => a.band === "later");
+    const renewedList = renewalsList.filter(a => a.renewed);
+    // Renewal rate: of the subscriptions that came due in the last 30 days, how
+    // many were renewed. Deliberately keyed on the expiry date, not on when the
+    // Renew button was pressed — a sale renewed late still counts for the month
+    // it expired in, which is the month you are judging.
+    // Sales expiring in the last 3 days are excluded: they have not had a fair
+    // chance to be renewed yet and would drag the number down for no reason.
+    const graceCut = addDays(todayStr(), -3);
+    const cutoff = addMonths(todayStr(), -1);
+    const dueRecently = renewalsList.filter(a =>
+      (a.renewDate || "") >= cutoff && (a.renewDate || "") <= graceCut);
+    const keptRecently = dueRecently.filter(a => a.renewed);
+    return {
+      late, week, month, later, renewedList,
+      lateVal: sum(late), weekVal: sum(week), monthVal: sum(month), laterVal: sum(later),
+      dueNowVal: sum(renDueNow),
+      rate: dueRecently.length > 0 ? Math.round((keptRecently.length / dueRecently.length) * 100) : null,
+      rateBase: dueRecently.length,
+    };
+  }, [renewalsList, renDueNow]);
+
 
   const renFilteredList = useMemo(() => {
     let list = renewalsList;
@@ -3612,15 +3732,23 @@ export default function App() {
       );
     }
     if (renProduct !== "all") list = list.filter(a => a.service === renProduct);
-    if (renFilter === "overdue") list = list.filter(a => a.isOverdue);
-    else if (renFilter === "expired") list = list.filter(a => a.daysUntil < 0 && a.status !== "Renewed");
-    else if (renFilter === "due") list = list.filter(a => a.needsReminder);
-    else if (renFilter === "upcoming") list = list.filter(a => a.isUpcoming);
-    else if (renFilter === "renewed") list = list.filter(a => a.status === "Renewed");
+    // Band filters. "all" hides renewed rows — they are history, and leaving them
+    // in the default view is what made the old tab look full of dead entries.
+    if (renFilter === "all") list = list.filter(a => !a.renewed);
+    else if (renFilter === "late") list = list.filter(a => a.band === "late");
+    else if (renFilter === "week") list = list.filter(a => a.band === "week");
+    else if (renFilter === "month") list = list.filter(a => a.band === "month");
+    else if (renFilter === "later") list = list.filter(a => a.band === "later");
+    else if (renFilter === "renewed") list = list.filter(a => a.renewed);
+    // Legacy filter ids kept working so nothing breaks if one is still stored
+    else if (renFilter === "overdue" || renFilter === "expired") list = list.filter(a => a.band === "late");
+    else if (renFilter === "due") list = list.filter(a => !a.renewed && a.needsReminder);
+    else if (renFilter === "upcoming") list = list.filter(a => !a.renewed && a.isUpcoming);
     if (renDateFrom) list = list.filter(a => (a.renewDate || "") >= renDateFrom);
     if (renDateTo) list = list.filter(a => (a.renewDate || "") <= renDateTo);
     // Sort
     if (renSort === "days") list = [...list].sort((x, y) => x.daysUntil - y.daysUntil);
+    else if (renSort === "value") list = [...list].sort((x, y) => (y.priceEGP || y.price || 0) - (x.priceEGP || x.price || 0));
     else if (renSort === "name") list = [...list].sort((x, y) => (x.customer || "").localeCompare(y.customer || ""));
     else if (renSort === "renewDate") list = [...list].sort((x, y) => (x.renewDate || "").localeCompare(y.renewDate || ""));
     return list;
@@ -3680,8 +3808,11 @@ export default function App() {
     const t0 = todayStr();
     const tmr = dateToStr(new Date(Date.now() + 864e5));
     const baseSales = isAdmin ? sales : scopedSales;
-    const rn = baseSales.filter(a => a.done && a.renewDate && (a.renewDate === t0 || a.renewDate === tmr));
-    const ex = baseSales.filter(a => a.done && a.renewDate && daysLeft(a.renewDate) < 0);
+    // Skip refunded and already-renewed sales: both have stopped being live
+    // subscriptions, and nagging about them buries the alerts that matter.
+    const liveSubs = baseSales.filter(a => a.done && a.renewDate && !a.refunded && !a.renewedAt);
+    const rn = liveSubs.filter(a => a.renewDate === t0 || a.renewDate === tmr);
+    const ex = liveSubs.filter(a => daysLeft(a.renewDate) < 0);
     const pp = baseSales.filter(a => {
       const pi = a.checklist ? a.checklist.find(c => c.label.toLowerCase().includes("payment")) : null;
       return pi && !pi.checked;
@@ -3701,6 +3832,20 @@ export default function App() {
       os.forEach(s => allN.push({ id: "o" + s, t: "danger", m: "📦 " + s + " out of stock!" }));
     }
     pendingProofs.forEach(a => allN.push({ id: "pp" + a.id, t: "warn", m: "📎 Proof pending: " + a.customer, saleId: a.id }));
+    // 💼 LinkedIn — one day before expiry and on the day itself.
+    // Blue so it reads apart from the amber/red alerts at a glance.
+    baseSales.forEach(a => {
+      if (!isLinkedInService(a.service) || !a.done || a.refunded || a.renewedAt) return;
+      if (!(a.period > 0) || !a.renewDate) return;
+      const d = daysLeft(a.renewDate);
+      if (d !== 0 && d !== 1) return;
+      allN.push({
+        id: "li" + a.id,
+        t: "linkedin",
+        m: "💼 LinkedIn: " + a.customer + (d === 0 ? " expires TODAY" : " expires TOMORROW"),
+        saleId: a.id,
+      });
+    });
     pp.forEach(a => allN.push({ id: "upc" + a.id, t: "warn", m: "💳 Payment not confirmed: " + a.customer + " (" + a.price + " " + (a.currency || "EGP") + ")", saleId: a.id }));
     // 💰 Partial payment dues — notify every day until cleared
     baseSales.forEach(s => {
@@ -3993,6 +4138,7 @@ export default function App() {
     { id: "customers",    label: "Customers",  icon: "👤", memberKey: "customers" },
     { id: "adobe",        label: "Adobe",      icon: "🎨", memberKey: "adobe" },
     { id: "adobeTracker", label: "Adobe Tracker", icon: "🎯", memberKey: "adobeTracker" },
+    { id: "liTracker",    label: "LinkedIn Tracker", icon: "💼", memberKey: "liTracker" },
     { id: "saleIntake",   label: "Sale Intake",   icon: "🧾", memberKey: "saleIntake" },
     { id: "renewals",     label: "Renewals",   icon: "🔄", memberKey: "renewals" },
     { id: "tasks",        label: "Tasks",      icon: "✅", memberKey: "tasks" },
@@ -4410,12 +4556,15 @@ export default function App() {
                   <div key={n.id} style={{
                     padding: "12px 14px",
                     marginBottom: 8,
-                    background: seenN.includes(n.id) ? (t.dark ? "#0f172a" : "#f5f7f9") : (n.t === "danger" ? (t.dark ? "#450a0a" : "#fef2f2") : (t.dark ? "#422006" : "#fffbeb")),
-                    borderLeft: "3px solid " + (n.t === "danger" ? t.danger : t.warning),
+                    background: seenN.includes(n.id) ? (t.dark ? "#0f172a" : "#f5f7f9")
+                      : n.t === "linkedin" ? (t.dark ? "#0c2a45" : "#eff6ff")
+                      : n.t === "danger" ? (t.dark ? "#450a0a" : "#fef2f2")
+                      : (t.dark ? "#422006" : "#fffbeb"),
+                    borderLeft: "3px solid " + (n.t === "linkedin" ? LI_BLUE : n.t === "danger" ? t.danger : t.warning),
                     borderRadius: 8,
                     opacity: seenN.includes(n.id) ? 0.7 : 1,
                   }}>
-                    <p style={{ margin: "0 0 8px", fontSize: t.fs.base, color: n.t === "danger" ? t.danger : "#b45309", fontWeight: 500 }}>{n.m}</p>
+                    <p style={{ margin: "0 0 8px", fontSize: t.fs.base, color: n.t === "linkedin" ? LI_BLUE : n.t === "danger" ? t.danger : "#b45309", fontWeight: 500 }}>{n.m}</p>
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                       {linkedSale && (
                         <button
@@ -6382,7 +6531,7 @@ export default function App() {
             </h2>
 
             {/* Critical alerts (admin only) */}
-            {isAdmin && alerts.allN.filter(n => n.t === "danger" || n.t === "warn").length > 0 && (
+            {isAdmin && alerts.allN.filter(n => n.t === "danger" || n.t === "warn" || n.t === "linkedin").length > 0 && (
               <div style={{
                 ...t.card,
                 marginBottom: 14,
@@ -7115,7 +7264,21 @@ export default function App() {
                 </div>
 
                 <div style={{ display: "flex", gap: 8 }}>
-                  <button onClick={() => setNewSale(null)} style={{ ...t.btnGhost, flex: 1 }}>Cancel</button>
+                  <button
+                    onClick={() => {
+                      // If this form was opened by Renew and is now abandoned,
+                      // un-stamp the original — otherwise it silently disappears
+                      // from the trackers without a renewal ever being recorded.
+                      const origId = newSale && newSale.renewalOf;
+                      if (origId) {
+                        setSales(p => p.map(x => x.id === origId
+                          ? { ...x, renewedAt: null, renewedBy: null }
+                          : x));
+                      }
+                      setNewSale(null);
+                    }}
+                    style={{ ...t.btnGhost, flex: 1 }}
+                  >Cancel</button>
                   <button onClick={addSaleEntry} style={{ ...t.btnPrimary, flex: 2 }}>💾 Save {newSale.lines.length > 1 ? (newSale.lines.length + " Sales") : "Sale"}</button>
                 </div>
               </div>
@@ -8685,6 +8848,263 @@ export default function App() {
         {/* ═══════════════════════════════════════════════════════════════
              🎯 ADOBE TRACKER TAB — accounts, rentals, history
              ═══════════════════════════════════════════════════════════════ */}
+        {/* ═══════════════════════════════════════════════════════════════
+             💼 LINKEDIN TRACKER — subscription dates, filters, renewal nudges
+             ═══════════════════════════════════════════════════════════════ */}
+        {tab === "liTracker" && (() => {
+          const rows = liList.filter(a => {
+            if (liSearch) {
+              const q = liSearch.toLowerCase();
+              if (!(a.customer || "").toLowerCase().includes(q)
+                && !(a.customerPhone || "").includes(q)
+                && !(a.customerEmail || "").toLowerCase().includes(q)
+                && !(a.service || "").toLowerCase().includes(q)) return false;
+            }
+            if (liFilter === "expiring") { if (!(a.recurring && a.daysUntil >= 0 && a.daysUntil <= 7)) return false; }
+            else if (liFilter === "expired") { if (!(a.recurring && a.daysUntil < 0)) return false; }
+            else if (liFilter === "active") { if (!(a.recurring && a.daysUntil > 7)) return false; }
+            else if (liFilter === "onetime") { if (a.recurring || a.renewed) return false; }
+            else if (liFilter === "renewed") { if (!a.renewed) return false; }
+            if (liFrom && (a.renewDate || "") < liFrom) return false;
+            if (liTo && (a.renewDate || "") > liTo) return false;
+            return true;
+          });
+
+          const nExpired = liList.filter(a => a.recurring && a.daysUntil < 0).length;
+          const nDueNow = liList.filter(a => a.recurring && (a.daysUntil === 0 || a.daysUntil === 1)).length;
+          const nSoon = liList.filter(a => a.recurring && a.daysUntil > 1 && a.daysUntil <= 7).length;
+          const nActive = liList.filter(a => a.recurring && a.daysUntil > 7).length;
+          const revenue = liList.reduce((s, a) => s + (a.priceEGP || a.price || 0), 0);
+
+          // The nudge Mohamed sends a day before expiry.
+          const renewMsg = (a) => "Hi " + (a.customer || "") + ","
+            + "\n\nYour *" + (a.service || "LinkedIn") + "* subscription "
+            + (a.daysUntil === 0 ? "expires *today* (" + a.renewDate + ")."
+               : a.daysUntil < 0 ? "expired on *" + a.renewDate + "*."
+               : "expires on *" + a.renewDate + "* (in " + a.daysUntil + " days).")
+            + "\n\nWant me to renew it for you so it keeps running without interruption?"
+            + "\n\n💰 " + (a.price || 0) + " " + (a.currency || "EGP") + " for " + (a.period || 1) + " month(s)"
+            + "\n\n_ProSkill Digital Agency_";
+
+          const card = (label, value, color, id) => (
+            <div
+              onClick={() => setLiFilter(liFilter === id ? "all" : id)}
+              style={{
+                ...t.card, textAlign: "center", padding: 14, cursor: id ? "pointer" : "default",
+                borderTop: "3px solid " + color,
+                background: liFilter === id ? (t.dark ? "rgba(10,102,194,0.15)" : "#eff6ff") : t.cardBg,
+              }}
+            >
+              <div style={{ fontSize: t.fs.xs, color: t.textMuted, fontWeight: 700 }}>{label}</div>
+              <div style={{ fontSize: t.fs.xl, fontWeight: 900, color }}>{value}</div>
+            </div>
+          );
+
+          return (
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
+                <h2 style={{ margin: 0, fontSize: t.fs.xl, fontWeight: 800 }}>💼 LinkedIn Tracker</h2>
+                <ExportMenu
+                  theme={t}
+                  onCsv={() => exportCSV(rows.map(a => ({
+                    Customer: a.customer, Phone: a.customerPhone || "", Service: a.service,
+                    Start: a.soldDate, Period: a.period, Renew: a.renewDate || "",
+                    DaysLeft: a.recurring ? a.daysUntil : "", Price: a.price,
+                    Currency: a.currency || "EGP", Vendor: a.vendor || "",
+                  })), "linkedin_" + todayStr() + ".csv")}
+                  onXlsx={() => exportExcel(rows.map(a => ({
+                    Customer: a.customer, Phone: a.customerPhone || "", Service: a.service,
+                    Start: a.soldDate, Period: a.period, Renew: a.renewDate || "",
+                    DaysLeft: a.recurring ? a.daysUntil : "", Price: a.price,
+                  })), "linkedin_" + todayStr() + ".xls", "LinkedIn")}
+                  onPdf={() => exportPDF("LinkedIn Subscriptions", rows.map(a => ({
+                    Customer: a.customer, Service: a.service,
+                    Start: a.soldDate, Renew: a.renewDate || "—",
+                    "Days Left": a.recurring ? String(a.daysUntil) : "—",
+                  })), "linkedin_" + todayStr() + ".pdf")}
+                />
+              </div>
+
+              {/* ── In-tab alerts: expiring tomorrow / today / already expired ── */}
+              {(nDueNow > 0 || nExpired > 0) && (
+                <div style={{
+                  ...t.card, marginBottom: 14, padding: 14,
+                  background: t.dark ? "#0c2a45" : "#eff6ff",
+                  borderLeft: "3px solid " + LI_BLUE,
+                }}>
+                  <div style={{ fontSize: t.fs.md, fontWeight: 800, color: LI_BLUE, marginBottom: 10 }}>
+                    🔔 Needs a renewal nudge
+                  </div>
+                  {liList.filter(a => a.recurring && a.daysUntil <= 1).map(a => {
+                    const urgent = a.daysUntil < 0;
+                    return (
+                      <div key={a.id} style={{
+                        display: "flex", justifyContent: "space-between", alignItems: "center",
+                        gap: 8, flexWrap: "wrap", padding: "8px 0",
+                        borderBottom: "1px solid " + t.border,
+                      }}>
+                        <div style={{ minWidth: 0, flex: 1 }}>
+                          <strong style={{ fontSize: t.fs.sm }}>{a.customer}</strong>
+                          <div style={{ fontSize: t.fs.xs, color: urgent ? t.danger : t.textMuted }}>
+                            {a.service} · {urgent
+                              ? "expired " + Math.abs(a.daysUntil) + "d ago (" + a.renewDate + ")"
+                              : a.daysUntil === 0 ? "expires TODAY" : "expires TOMORROW"}
+                          </div>
+                        </div>
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <button onClick={() => setSelSale(a)} style={{ ...t.btnGhost, padding: "5px 12px", fontSize: t.fs.xs, minHeight: 30 }}>Open</button>
+                          {a.customerPhone && (
+                            <a
+                              href={waLink(a.customerPhone, renewMsg(a))}
+                              target="_blank" rel="noreferrer"
+                              style={{ ...t.btnWA, padding: "5px 12px", fontSize: t.fs.xs, minHeight: 30 }}
+                            >📱 Remind</a>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* KPIs — each one doubles as a filter */}
+              <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(5, 1fr)", gap: t.sp.md, marginBottom: 14 }}>
+                {card("TOTAL", liList.length, LI_BLUE, "all")}
+                {card("🔴 EXPIRED", nExpired, t.danger, "expired")}
+                {card("🟠 ≤7 DAYS", nDueNow + nSoon, "#f97316", "expiring")}
+                {card("🟢 ACTIVE", nActive, t.success, "active")}
+                {card("💰 REVENUE", revenue.toLocaleString(), t.primary, null)}
+              </div>
+
+              {/* Filters */}
+              <div style={{ ...t.card, marginBottom: 12, padding: 12 }}>
+                <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "2fr 1fr auto", gap: 8, marginBottom: 8 }}>
+                  <input placeholder="🔍 Search customer / phone / service..." value={liSearch} onChange={e => setLiSearch(e.target.value)} style={t.input} />
+                  <select value={liFilter} onChange={e => setLiFilter(e.target.value)} style={t.input}>
+                    <option value="all">All</option>
+                    <option value="expiring">🟠 Expiring ≤7 days</option>
+                    <option value="expired">🔴 Expired</option>
+                    <option value="active">🟢 Active</option>
+                    <option value="onetime">⚪ One-time / lifetime</option>
+                    <option value="renewed">🔄 Renewed</option>
+                  </select>
+                  {(liSearch || liFilter !== "all" || liFrom || liTo) && (
+                    <button onClick={() => { setLiSearch(""); setLiFilter("all"); setLiFrom(""); setLiTo(""); }} style={t.btnGhost}>✕ Clear</button>
+                  )}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <div>
+                    <label style={t.label}>Renews from</label>
+                    <input type="date" value={liFrom} onChange={e => setLiFrom(e.target.value)} style={t.input} />
+                  </div>
+                  <div>
+                    <label style={t.label}>Renews to</label>
+                    <input type="date" value={liTo} onChange={e => setLiTo(e.target.value)} style={t.input} />
+                  </div>
+                </div>
+                <div style={{ fontSize: t.fs.sm, color: t.textMuted, marginTop: 8 }}>
+                  Showing <strong style={{ color: LI_BLUE }}>{rows.length}</strong> of {liList.length}
+                </div>
+              </div>
+
+              {/* List */}
+              {rows.length === 0 ? (
+                <div style={{ ...t.card, padding: 40, textAlign: "center", color: t.textMuted }}>
+                  <div style={{ fontSize: 40, marginBottom: 10 }}>💼</div>
+                  <p>{liList.length === 0 ? "No LinkedIn sales recorded yet." : "Nothing matches these filters."}</p>
+                </div>
+              ) : isMobile ? (
+                rows.map(a => {
+                  const c = !a.recurring ? t.textMuted
+                    : a.daysUntil < 0 ? t.danger
+                    : a.daysUntil <= 7 ? "#f97316" : t.success;
+                  return (
+                    <div key={a.id} style={{ ...t.card, marginBottom: 10, padding: 14, borderLeft: "3px solid " + c }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 6 }}>
+                        <div style={{ minWidth: 0, flex: 1 }}>
+                          <strong onClick={() => setSelSale(a)} style={{ cursor: "pointer" }}>{a.customer}</strong>
+                          <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>{a.service}</div>
+                        </div>
+                        <div style={{ textAlign: "right", flexShrink: 0 }}>
+                          <div style={{ fontSize: t.fs.sm, fontWeight: 700, color: c }}>
+                            {a.renewed ? "🔄 Renewed"
+                              : !a.recurring ? (a.period === -1 ? "♾️ Lifetime" : "⚪ One-time")
+                              : a.daysUntil < 0 ? Math.abs(a.daysUntil) + "d ago"
+                              : a.daysUntil + "d left"}
+                          </div>
+                          <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>{a.renewDate || "—"}</div>
+                        </div>
+                      </div>
+                      <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>
+                        📅 {a.soldDate} → {a.renewDate || "—"} · {a.period}mo · {a.price} {a.currency || "EGP"}
+                      </div>
+                      {a.customerPhone && a.recurring && a.daysUntil <= 7 && (
+                        <a
+                          href={waLink(a.customerPhone, renewMsg(a))}
+                          target="_blank" rel="noreferrer"
+                          style={{ ...t.btnWA, width: "100%", justifyContent: "center", marginTop: 8, fontSize: t.fs.sm }}
+                        >📱 Send renewal reminder</a>
+                      )}
+                    </div>
+                  );
+                })
+              ) : (
+                <div style={{ ...t.card, padding: 0, overflow: "hidden" }}>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 900, fontSize: t.fs.sm }}>
+                      <thead>
+                        <tr style={{ background: t.cardBg2 }}>
+                          {["Customer", "Service", "Start", "Period", "Renews", "Days Left", "Price", ""].map(h => (
+                            <th key={h} style={{ padding: "10px 12px", textAlign: "left", fontSize: t.fs.xs, color: t.textMuted, fontWeight: 700, textTransform: "uppercase" }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {rows.map(a => {
+                          const c = !a.recurring ? t.textMuted
+                            : a.daysUntil < 0 ? t.danger
+                            : a.daysUntil <= 7 ? "#f97316" : t.success;
+                          const rowBg = a.recurring && a.daysUntil < 0 ? (t.dark ? "#1c0e0e" : "#fef2f2")
+                            : a.recurring && a.daysUntil <= 1 ? (t.dark ? "#0c2a45" : "#eff6ff")
+                            : "transparent";
+                          return (
+                            <tr key={a.id} style={{ borderBottom: "1px solid " + t.border, background: rowBg }}>
+                              <td style={{ padding: "10px 12px", fontWeight: 700, cursor: "pointer" }} onClick={() => setSelSale(a)}>
+                                {a.customer}
+                                {a.customerPhone && <div style={{ fontSize: t.fs.xs, color: t.textMuted, fontWeight: 400 }}>{a.customerPhone}</div>}
+                              </td>
+                              <td style={{ padding: "10px 12px" }}>{a.service}</td>
+                              <td style={{ padding: "10px 12px", color: t.textMuted }}>{a.soldDate}</td>
+                              <td style={{ padding: "10px 12px" }}>{a.period === -1 ? "♾️" : a.period + "mo"}</td>
+                              <td style={{ padding: "10px 12px", fontWeight: 600 }}>{a.renewDate || "—"}</td>
+                              <td style={{ padding: "10px 12px", fontWeight: 700, color: c }}>
+                                {a.renewed ? "🔄 Renewed"
+                                  : !a.recurring ? "—"
+                                  : a.daysUntil < 0 ? Math.abs(a.daysUntil) + "d ago"
+                                  : a.daysUntil + "d"}
+                              </td>
+                              <td style={{ padding: "10px 12px", color: t.success }}>{a.price} {a.currency || "EGP"}</td>
+                              <td style={{ padding: "10px 12px" }}>
+                                {a.customerPhone && a.recurring && a.daysUntil <= 7 && (
+                                  <a
+                                    href={waLink(a.customerPhone, renewMsg(a))}
+                                    target="_blank" rel="noreferrer"
+                                    style={{ ...t.btnWA, padding: "4px 10px", fontSize: t.fs.xs, minHeight: 28 }}
+                                  >📱</a>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
         {tab === "adobeTracker" && (() => {
           const canEdit = isAdmin || can("adobeTracker");
           // Get current rental for each account (latest active one)
@@ -9119,190 +9539,432 @@ export default function App() {
         })()}
 
         {/* ═══════════════════════════════════════════════════════════════
-             🔄 RENEWALS TAB — all subscriptions sorted by renew date
+             🔄 RENEWALS TAB — urgency-first: who needs a message today
+             Adobe lives in its own tab (month-by-month), so it is excluded here.
              ═══════════════════════════════════════════════════════════════ */}
-        {tab === "renewals" && (
-          <div>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
-              <h2 style={{ margin: 0, fontSize: t.fs.xl, fontWeight: 800 }}>🔄 All Subscription Renewals</h2>
-              <span style={{ fontSize: t.fs.sm, color: t.textMuted }}>
-                {renewalsList.length} active subscription{renewalsList.length !== 1 ? "s" : ""}
-              </span>
-            </div>
+        {tab === "renewals" && (() => {
+          // The nudge, worded to match how close the expiry is.
+          const remindMsg = (a) => "Hi " + (a.customer || "") + ","
+            + "\n\nYour *" + (a.service || "") + "* subscription "
+            + (a.daysUntil < 0 ? "expired on *" + a.renewDate + "*."
+               : a.daysUntil === 0 ? "expires *today* (" + a.renewDate + ")."
+               : a.daysUntil === 1 ? "expires *tomorrow* (" + a.renewDate + ")."
+               : "expires on *" + a.renewDate + "* (in " + a.daysUntil + " days).")
+            + "\n\nWant me to renew it so it keeps running without interruption?"
+            + "\n\n💰 " + (a.price || 0) + " " + (a.currency || "EGP") + " for " + (a.period || 1) + " month(s)"
+            + "\n\n_ProSkill Digital Agency_";
 
-            {/* Summary cards */}
-            <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(4, 1fr)", gap: t.sp.md, marginBottom: 14 }}>
-              {(() => {
-                const overdueArr = renewalsList.filter(a => a.isOverdue && a.status !== "Renewed");
-                const dueArr = renewalsList.filter(a => a.needsReminder);
-                const upcomingArr = renewalsList.filter(a => a.isUpcoming);
-                const renewedArr = renewalsList.filter(a => a.status === "Renewed");
-                return [
-                  { l: "OVERDUE/EXPIRED", v: overdueArr.length, c: t.danger, i: "🚨" },
-                  { l: "DUE SOON (≤2d)", v: dueArr.length, c: t.warning, i: "⚠️" },
-                  { l: "UPCOMING (≤30d)", v: upcomingArr.length, c: t.primary, i: "⏰" },
-                  { l: "RENEWED", v: renewedArr.length, c: t.success, i: "✅" },
-                ];
-              })().map((c, i) => (
-                <div key={i} style={{ ...t.card, textAlign: "center", padding: 14, borderTop: "3px solid " + c.c }}>
-                  <div style={{ fontSize: t.fs.xs, color: t.textMuted, fontWeight: 700 }}>{c.i} {c.l}</div>
-                  <div style={{ fontSize: t.fs.xxl, fontWeight: 900, color: c.c }}>{c.v}</div>
+          const bandColor = (b) => b === "late" ? t.danger
+            : b === "week" ? "#f97316"
+            : b === "month" ? t.warning
+            : b === "renewed" ? t.textMuted
+            : t.success;
+
+          const timeLeftLabel = (a) => a.renewed ? "🔄 Renewed"
+            : a.daysUntil < 0 ? Math.abs(a.daysUntil) + (Math.abs(a.daysUntil) === 1 ? " day late" : " days late")
+            : a.daysUntil === 0 ? "Today"
+            : a.daysUntil === 1 ? "Tomorrow"
+            : a.daysUntil + " days";
+
+          // Group the filtered rows under urgency headings, but only when the
+          // view actually spans several bands — headings over one group is noise.
+          const BAND_LABELS = {
+            late:   { icon: "🔴", text: "Late" },
+            week:   { icon: "🟠", text: "Next 7 days" },
+            month:  { icon: "🟡", text: "Later this month" },
+            later:  { icon: "🟢", text: "Beyond this month" },
+            renewed:{ icon: "🔄", text: "Renewed" },
+          };
+          const grouped = ["late", "week", "month", "later", "renewed"]
+            .map(b => ({ band: b, rows: renFilteredList.filter(r => r.band === b) }))
+            .filter(g => g.rows.length > 0);
+          const showHeadings = grouped.length > 1;
+
+          const bandCard = (id, label, count, value, color) => (
+            <div
+              key={id}
+              onClick={() => setRenFilter(renFilter === id ? "all" : id)}
+              style={{
+                ...t.card, textAlign: "center", padding: 12, cursor: "pointer",
+                borderTop: "3px solid " + color,
+                background: renFilter === id ? (t.dark ? "#24344d" : "#eef2f7") : t.cardBg,
+              }}
+            >
+              <div style={{ fontSize: t.fs.xxl, fontWeight: 900, color, lineHeight: 1.1 }}>{count}</div>
+              <div style={{ fontSize: t.fs.xs, color: t.textMuted, fontWeight: 700 }}>{label}</div>
+              {value != null && (
+                <div style={{ fontSize: t.fs.xs, color: t.textMuted, marginTop: 2 }}>
+                  {value.toLocaleString()} EGP
                 </div>
-              ))}
+              )}
             </div>
+          );
 
-            {/* Filters */}
-            <div style={{ ...t.card, marginBottom: 12, padding: isMobile ? 12 : 14 }}>
-              <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "2fr 1fr 1fr 1fr", gap: 8, marginBottom: 8 }}>
-                <input
-                  placeholder="🔍 Search customer, phone, email, service..."
-                  value={renSearch}
-                  onChange={e => setRenSearch(e.target.value)}
-                  style={t.input}
+          return (
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, flexWrap: "wrap", gap: 10 }}>
+                <h2 style={{ margin: 0, fontSize: t.fs.xl, fontWeight: 800 }}>🔄 Renewals</h2>
+                <ExportMenu
+                  theme={t}
+                  onCsv={() => exportCSV(renFilteredList.map(a => ({
+                    Customer: a.customer, Phone: a.customerPhone || "", Service: a.service,
+                    Started: a.soldDate, Expires: a.renewDate, Period: a.period,
+                    DaysLeft: a.renewed ? "" : a.daysUntil,
+                    Status: a.renewed ? "Renewed" : a.band,
+                    Value: a.price, Currency: a.currency || "EGP",
+                  })), "renewals_" + todayStr() + ".csv")}
+                  onXlsx={() => exportExcel(renFilteredList.map(a => ({
+                    Customer: a.customer, Phone: a.customerPhone || "", Service: a.service,
+                    Started: a.soldDate, Expires: a.renewDate,
+                    DaysLeft: a.renewed ? "" : a.daysUntil, Value: a.price,
+                  })), "renewals_" + todayStr() + ".xls", "Renewals")}
+                  onPdf={() => exportPDF("Renewals", renFilteredList.map(a => ({
+                    Customer: a.customer, Service: a.service,
+                    Expires: a.renewDate,
+                    "Time left": timeLeftLabel(a),
+                    Value: a.price + " " + (a.currency || "EGP"),
+                  })), "renewals_" + todayStr() + ".pdf")}
                 />
-                <select value={renFilter} onChange={e => setRenFilter(e.target.value)} style={t.input}>
-                  <option value="all">All</option>
-                  <option value="overdue">🚨 Overdue</option>
-                  <option value="expired">⛔ Expired</option>
-                  <option value="due">⚠️ Due (≤2d)</option>
-                  <option value="upcoming">⏰ Upcoming (≤30d)</option>
-                  <option value="renewed">✓ Renewed</option>
-                </select>
-                <select value={renProduct} onChange={e => setRenProduct(e.target.value)} style={t.input}>
-                  <option value="all">All Products</option>
-                  {svcNames.map(s => <option key={s} value={s}>{s}</option>)}
-                </select>
-                <select value={renSort} onChange={e => setRenSort(e.target.value)} style={t.input}>
-                  <option value="days">Sort: Days left</option>
-                  <option value="name">Sort: Customer</option>
-                  <option value="renewDate">Sort: Renew date</option>
-                </select>
               </div>
-              <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "1fr 1fr auto", gap: 8, alignItems: "end" }}>
-                <div>
-                  <label style={t.label}>Renew From</label>
-                  <input type="date" value={renDateFrom} onChange={e => setRenDateFrom(e.target.value)} style={t.input} />
-                </div>
-                <div>
-                  <label style={t.label}>Renew To</label>
-                  <input type="date" value={renDateTo} onChange={e => setRenDateTo(e.target.value)} style={t.input} />
-                </div>
-                {(renSearch || renFilter !== "all" || renProduct !== "all" || renDateFrom || renDateTo) && (
-                  <button
-                    onClick={() => { setRenSearch(""); setRenFilter("all"); setRenProduct("all"); setRenDateFrom(""); setRenDateTo(""); }}
-                    style={{ ...t.btnGhost, padding: "8px 14px" }}
-                  >✕ Clear</button>
+              <p style={{ margin: "0 0 14px", fontSize: t.fs.sm, color: t.textMuted }}>
+                Every subscription that expires.
+                {adobeRenewalCount > 0 && (
+                  <>
+                    {" "}Adobe renews month by month —{" "}
+                    <span
+                      onClick={() => setTab("adobe")}
+                      style={{ color: t.primary, cursor: "pointer", fontWeight: 600 }}
+                    >{adobeRenewalCount} Adobe subscription{adobeRenewalCount !== 1 ? "s" : ""} are in the Adobe tab</span>.
+                  </>
                 )}
-              </div>
-              <div style={{ fontSize: t.fs.sm, color: t.textMuted, marginTop: 8 }}>
-                Showing <strong style={{ color: t.primary }}>{renFilteredList.length}</strong> of {renewalsList.length}
-              </div>
-            </div>
+              </p>
 
-            {renFilteredList.length === 0 ? (
-              <div style={{ ...t.card, textAlign: "center", padding: 30, color: t.textMuted }}>
-                <div style={{ fontSize: 40, marginBottom: 10 }}>🔄</div>
-                <p style={{ margin: 0 }}>{renewalsList.length === 0 ? "No subscriptions yet." : "No subscriptions match your filters."}</p>
-              </div>
-            ) : isMobile ? (
-              /* MOBILE: cards */
-              <div>
-                {renFilteredList.map(a => {
-                  const days = a.daysUntil;
-                  const dColor = a.status === "Renewed" ? t.success : days < 0 ? t.danger : days <= 2 ? t.warning : days <= 7 ? t.warning : t.success;
-                  const dLabel = a.status === "Renewed" ? "Renewed" : days < 0 ? Math.abs(days) + "d ago" : days === 0 ? "TODAY" : days + "d";
-                  return (
-                    <div
-                      key={a.id}
-                      onClick={() => setSelSale(a)}
-                      style={{
-                        ...t.card, marginBottom: 10, cursor: "pointer", padding: 14,
-                        borderLeft: "3px solid " + dColor,
-                      }}
-                    >
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, marginBottom: 6 }}>
-                        <div style={{ minWidth: 0, flex: 1 }}>
-                          <div style={{ fontSize: t.fs.md, fontWeight: 700 }}>{a.customer}</div>
-                          <div style={{ fontSize: t.fs.sm, color: t.textMuted }}>{svcIcon(a.service)} {a.service}</div>
-                          {a.customerPhone && <div style={{ fontSize: t.fs.sm, color: t.primary }}>📞 {a.customerPhone}</div>}
-                          {a.customerEmail && <div style={{ fontSize: t.fs.xs, color: t.textMuted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>✉️ {a.customerEmail}</div>}
+              {/* ── Action strip: the reason you opened this tab ── */}
+              {renDueNow.length > 0 && (
+                <div style={{
+                  borderRadius: 14, padding: 16, marginBottom: 14,
+                  background: t.dark ? "linear-gradient(180deg,#24344d 0%,#1e293b 100%)" : "#fff",
+                  border: "1px solid " + (t.dark ? "#3d5070" : t.border),
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+                    <div style={{ fontSize: t.fs.lg, fontWeight: 800 }}>🔔 Needs you today</div>
+                    <div style={{ fontSize: t.fs.sm, color: t.textMuted }}>
+                      <strong style={{ color: t.text }}>{renDueNow.length}</strong> customer{renDueNow.length !== 1 ? "s" : ""}
+                      {" · "}<strong style={{ color: t.text }}>{renStats.dueNowVal.toLocaleString()} EGP</strong> at risk
+                    </div>
+                  </div>
+                  {(renDueExpanded ? renDueNow : renDueNow.slice(0, 4)).map(a => {
+                    const c = bandColor(a.band);
+                    return (
+                      <div key={a.id} style={{
+                        display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap",
+                        padding: "10px 12px", borderRadius: 10, marginBottom: 6,
+                        background: a.daysUntil < 0 ? (t.dark ? "#1c0e0e" : "#fef2f2")
+                          : a.daysUntil === 0 ? (t.dark ? "#1f1610" : "#fff7ed")
+                          : t.cardBg2,
+                        borderLeft: "3px solid " + c,
+                      }}>
+                        <div style={{ flex: 1, minWidth: 150 }}>
+                          <strong
+                            onClick={() => setSelSale(a)}
+                            style={{ fontSize: t.fs.base, cursor: "pointer" }}
+                          >{a.customer}</strong>
+                          <div style={{ fontSize: t.fs.xs, color: t.textMuted, marginTop: 1 }}>
+                            {svcIcon(a.service)} {a.service} · {a.price} {a.currency || "EGP"} · {a.period}mo
+                          </div>
                         </div>
-                        <div style={{ textAlign: "right", flexShrink: 0 }}>
-                          <div style={{ fontSize: t.fs.sm, fontWeight: 800, color: dColor }}>{dLabel}</div>
+                        <div style={{ textAlign: "right", minWidth: 78 }}>
+                          <div style={{ fontSize: t.fs.sm, fontWeight: 700, color: c }}>{timeLeftLabel(a)}</div>
                           <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>{a.renewDate}</div>
-                          <div style={{ fontSize: t.fs.sm, fontWeight: 700, color: t.success, marginTop: 2 }}>{a.price} {a.currency || "EGP"}</div>
+                        </div>
+                        <div style={{ display: "flex", gap: 6 }}>
+                          {a.customerPhone && (
+                            <a
+                              href={waLink(a.customerPhone, remindMsg(a))}
+                              target="_blank" rel="noreferrer"
+                              style={{ ...t.btnWA, padding: "6px 12px", fontSize: t.fs.xs, minHeight: 32 }}
+                            >📱 Remind</a>
+                          )}
+                          {canEditSale(a) && (
+                            <button
+                              onClick={() => renewSale(a)}
+                              style={{ ...t.btnPrimary, background: t.success, padding: "6px 12px", fontSize: t.fs.xs, minHeight: 32 }}
+                            >✓ Renew</button>
+                          )}
                         </div>
                       </div>
-                      {a.customerPhone && (
-                        <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
-                          <a
-                            href={waLink(a.customerPhone, "Hi " + a.customer + ", your " + a.service + " renews on " + a.renewDate)}
-                            target="_blank" rel="noreferrer"
-                            onClick={e => e.stopPropagation()}
-                            style={{ ...t.btnWA, padding: "6px 12px", fontSize: t.fs.sm, flex: 1, justifyContent: "center" }}
-                          >📱 WhatsApp</a>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            ) : (
-              /* DESKTOP: table */
-              <div style={{ ...t.card, padding: 0, overflow: "hidden" }}>
-                <div style={{ overflow: "auto" }}>
-                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                    <thead>
-                      <tr style={{ background: t.cardBg2 }}>
-                        {["Customer", "Phone", "Email", "Service", "Price", "Renew Date", "Days", "Status", "Actions"].map(h => (
-                          <th key={h} style={{ padding: "10px 12px", textAlign: "left", fontSize: t.fs.xs, color: t.textMuted, fontWeight: 700, textTransform: "uppercase" }}>{h}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {renFilteredList.map(a => {
-                        const days = a.daysUntil;
-                        const rowBg = a.status === "Renewed" ? (t.dark ? "#052e16" : "#f0fdf4")
-                          : days < 0 ? (t.dark ? "#450a0a" : "#fef2f2")
-                          : days <= 2 ? (t.dark ? "#422006" : "#fffbeb")
-                          : "transparent";
-                        const stColor = a.status === "Renewed" ? t.success : days < 0 ? t.danger : days <= 2 ? t.warning : t.primary;
-                        const stLabel = a.status === "Renewed" ? "Renewed" : days < 0 ? "Expired" : days <= 2 ? "Due" : "Pending";
-                        return (
-                          <tr key={a.id} style={{ borderBottom: "1px solid " + t.border, background: rowBg, cursor: "pointer" }} onClick={() => setSelSale(a)}>
-                            <td style={{ padding: "10px 12px", fontWeight: 600 }}>{a.customer}</td>
-                            <td style={{ padding: "10px 12px", color: t.primary }}>{a.customerPhone || "—"}</td>
-                            <td style={{ padding: "10px 12px", color: t.textMuted, fontSize: t.fs.xs }}>{a.customerEmail || "—"}</td>
-                            <td style={{ padding: "10px 12px" }}>{svcIcon(a.service)} {a.service}</td>
-                            <td style={{ padding: "10px 12px", fontWeight: 700, color: t.success }}>{a.price} {a.currency || "EGP"}</td>
-                            <td style={{ padding: "10px 12px" }}>{a.renewDate}</td>
-                            <td style={{ padding: "10px 12px", fontWeight: 700, color: stColor }}>{days < 0 ? Math.abs(days) + "d ago" : days + "d"}</td>
-                            <td style={{ padding: "10px 12px" }}>
-                              <span style={{
-                                padding: "2px 10px", borderRadius: 20, fontSize: t.fs.xs, fontWeight: 700,
-                                background: stColor + "22", color: stColor,
-                              }}>{stLabel}</span>
-                            </td>
-                            <td style={{ padding: "10px 12px" }}>
-                              {a.customerPhone && (
-                                <a
-                                  href={waLink(a.customerPhone, "Hi " + a.customer + ", your " + a.service + " renews on " + a.renewDate)}
-                                  target="_blank" rel="noreferrer"
-                                  onClick={e => e.stopPropagation()}
-                                  style={{ ...t.btnWA, padding: "4px 10px", fontSize: t.fs.xs, minHeight: 28 }}
-                                >📱</a>
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
+                    );
+                  })}
+                  {renDueNow.length > 4 && (
+                    <button
+                      onClick={() => setRenDueExpanded(v => !v)}
+                      style={{ ...t.btnGhost, width: "100%", marginTop: 4, fontSize: t.fs.sm }}
+                    >
+                      {renDueExpanded ? "Show fewer" : "Show all " + renDueNow.length}
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* ── Urgency bands, in money as well as counts ── */}
+              <div style={{
+                display: "grid",
+                gridTemplateColumns: isMobile ? "repeat(2, 1fr)" : "repeat(5, 1fr)",
+                gap: t.sp.md, marginBottom: 14,
+              }}>
+                {bandCard("late",  "LATE",         renStats.late.length,  renStats.lateVal,  t.danger)}
+                {bandCard("week",  "NEXT 7 DAYS",  renStats.week.length,  renStats.weekVal,  "#f97316")}
+                {bandCard("month", "THIS MONTH",   renStats.month.length, renStats.monthVal, t.warning)}
+                {bandCard("later", "LATER",        renStats.later.length, renStats.laterVal, t.success)}
+                <div style={{ ...t.card, textAlign: "center", padding: 12, borderTop: "3px solid " + t.primary }}>
+                  <div style={{ fontSize: t.fs.xxl, fontWeight: 900, color: t.primary, lineHeight: 1.1 }}>
+                    {renStats.rate == null ? "—" : renStats.rate + "%"}
+                  </div>
+                  <div style={{ fontSize: t.fs.xs, color: t.textMuted, fontWeight: 700 }}>RENEWED</div>
+                  <div style={{ fontSize: t.fs.xs, color: t.textMuted, marginTop: 2 }}>
+                    {renStats.rateBase > 0
+                      ? "of " + renStats.rateBase + " that expired"
+                      : "none expired yet"}
+                  </div>
                 </div>
               </div>
-            )}
-          </div>
-        )}
+
+              {/* ── Filters ── */}
+              <div style={{ ...t.card, marginBottom: 12, padding: 12 }}>
+                <div style={{
+                  display: "grid",
+                  gridTemplateColumns: isMobile ? "1fr" : "2fr 1fr 1fr auto",
+                  gap: 8,
+                }}>
+                  <input
+                    placeholder="🔍 Customer, phone, or service…"
+                    value={renSearch}
+                    onChange={e => setRenSearch(e.target.value)}
+                    style={t.input}
+                  />
+                  <select value={renProduct} onChange={e => setRenProduct(e.target.value)} style={t.input}>
+                    <option value="all">All services</option>
+                    {svcNames.filter(s => s.toLowerCase() !== "adobe").map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                  <select value={renSort} onChange={e => setRenSort(e.target.value)} style={t.input}>
+                    <option value="days">Sort: soonest first</option>
+                    <option value="value">Value: highest first</option>
+                    <option value="name">Customer A–Z</option>
+                    <option value="renewDate">Expiry date</option>
+                  </select>
+                  {(renSearch || renProduct !== "all" || renFilter !== "all" || renDateFrom || renDateTo) && (
+                    <button
+                      onClick={() => { setRenSearch(""); setRenProduct("all"); setRenFilter("all"); setRenDateFrom(""); setRenDateTo(""); }}
+                      style={t.btnGhost}
+                    >✕ Clear</button>
+                  )}
+                </div>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
+                  {[
+                    { id: "all",     l: "Upcoming " + renewalsList.filter(a => !a.renewed).length },
+                    { id: "late",    l: "🔴 Late " + renStats.late.length },
+                    { id: "week",    l: "🟠 Next 7 days " + renStats.week.length },
+                    { id: "later",   l: "🟢 Beyond " + renStats.later.length },
+                    { id: "renewed", l: "🔄 Renewed " + renStats.renewedList.length },
+                  ].map(c => (
+                    <span
+                      key={c.id}
+                      onClick={() => setRenFilter(c.id)}
+                      style={{
+                        padding: "5px 12px", borderRadius: 20, fontSize: t.fs.xs, fontWeight: 700,
+                        cursor: "pointer",
+                        background: renFilter === c.id ? t.primary : t.cardBg2,
+                        color: renFilter === c.id ? "#fff" : t.textMuted,
+                        border: "1px solid " + (renFilter === c.id ? t.primary : t.border),
+                      }}
+                    >{c.l}</span>
+                  ))}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8 }}>
+                  <div>
+                    <label style={t.label}>Expires from</label>
+                    <input type="date" value={renDateFrom} onChange={e => setRenDateFrom(e.target.value)} style={t.input} />
+                  </div>
+                  <div>
+                    <label style={t.label}>Expires to</label>
+                    <input type="date" value={renDateTo} onChange={e => setRenDateTo(e.target.value)} style={t.input} />
+                  </div>
+                </div>
+              </div>
+
+              {/* ── The list ── */}
+              {renFilteredList.length === 0 ? (
+                <div style={{ ...t.card, padding: 40, textAlign: "center", color: t.textMuted }}>
+                  <div style={{ fontSize: 40, marginBottom: 10 }}>🔄</div>
+                  <p style={{ margin: 0 }}>
+                    {renewalsList.length === 0
+                      ? "No recurring subscriptions yet. Sales with a renewal period show up here."
+                      : "Nothing matches these filters."}
+                  </p>
+                </div>
+              ) : isMobile ? (
+                grouped.map(g => (
+                  <div key={g.band}>
+                    {showHeadings && (
+                      <div style={{
+                        padding: "6px 10px", marginBottom: 6, borderRadius: 8,
+                        background: t.cardBg2, fontSize: t.fs.xs, fontWeight: 700, color: t.textMuted,
+                      }}>
+                        {BAND_LABELS[g.band].icon} {BAND_LABELS[g.band].text} — {g.rows.length}
+                      </div>
+                    )}
+                    {g.rows.map(a => {
+                      const c = bandColor(a.band);
+                      return (
+                        <div key={a.id} style={{
+                          ...t.card, marginBottom: 10, padding: 14,
+                          borderLeft: "3px solid " + c,
+                          opacity: a.renewed ? 0.55 : 1,
+                        }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 6 }}>
+                            <div style={{ minWidth: 0, flex: 1 }}>
+                              <strong onClick={() => setSelSale(a)} style={{ cursor: "pointer" }}>{a.customer}</strong>
+                              <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>
+                                {svcIcon(a.service)} {a.service}
+                              </div>
+                            </div>
+                            <div style={{ textAlign: "right", flexShrink: 0 }}>
+                              <div style={{ fontSize: t.fs.sm, fontWeight: 700, color: c }}>{timeLeftLabel(a)}</div>
+                              <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>{a.renewDate}</div>
+                            </div>
+                          </div>
+                          {!a.renewed && (
+                            <div style={{ height: 4, background: t.border, borderRadius: 2, overflow: "hidden", marginBottom: 8 }}>
+                              <div style={{ height: "100%", width: a.pct + "%", background: c }} />
+                            </div>
+                          )}
+                          <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>
+                            📅 {a.soldDate} → {a.renewDate} · {a.period}mo · {a.price} {a.currency || "EGP"}
+                          </div>
+                          {a.renewed && a.renewedAt && (
+                            <div style={{ fontSize: t.fs.xs, color: t.textMuted, marginTop: 4 }}>
+                              Renewed {new Date(a.renewedAt).toLocaleDateString()}
+                              {a.renewedBy ? " by " + a.renewedBy : ""}
+                            </div>
+                          )}
+                          {!a.renewed && (
+                            <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                              {a.customerPhone && (
+                                <a
+                                  href={waLink(a.customerPhone, remindMsg(a))}
+                                  target="_blank" rel="noreferrer"
+                                  style={{ ...t.btnWA, flex: 1, justifyContent: "center", fontSize: t.fs.sm }}
+                                >📱 Remind</a>
+                              )}
+                              {canEditSale(a) && (
+                                <button
+                                  onClick={() => renewSale(a)}
+                                  style={{ ...t.btnPrimary, background: t.success, flex: 1, fontSize: t.fs.sm }}
+                                >✓ Renew</button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ))
+              ) : (
+                <div style={{ ...t.card, padding: 0, overflow: "hidden" }}>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 900, fontSize: t.fs.sm }}>
+                      <thead>
+                        <tr style={{ background: t.cardBg2 }}>
+                          {["Customer", "Service", "Started", "Expires", "Time left", "Value", ""].map(h => (
+                            <th key={h} style={{
+                              padding: "9px 10px", textAlign: "left", fontSize: t.fs.xs,
+                              color: t.textMuted, fontWeight: 700, textTransform: "uppercase",
+                            }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {grouped.map(g => (
+                          <Fragment key={g.band}>
+                            {showHeadings && (
+                              <tr>
+                                <td colSpan={7} style={{
+                                  padding: "7px 10px", background: t.dark ? "#18243a" : "#eef2f7",
+                                  fontSize: t.fs.xs, fontWeight: 700, color: t.textMuted,
+                                  borderBottom: "1px solid " + t.border,
+                                }}>
+                                  {BAND_LABELS[g.band].icon} {BAND_LABELS[g.band].text} — {g.rows.length}
+                                </td>
+                              </tr>
+                            )}
+                            {g.rows.map(a => {
+                              const c = bandColor(a.band);
+                              const rowBg = a.band === "late" ? (t.dark ? "#1c0e0e" : "#fef2f2")
+                                : a.band === "week" && a.daysUntil <= 1 ? (t.dark ? "#1f1610" : "#fff7ed")
+                                : "transparent";
+                              return (
+                                <tr key={a.id} style={{
+                                  borderBottom: "1px solid " + t.border,
+                                  background: rowBg,
+                                  opacity: a.renewed ? 0.55 : 1,
+                                }}>
+                                  <td style={{ padding: "10px", cursor: "pointer" }} onClick={() => setSelSale(a)}>
+                                    <strong>{a.customer}</strong>
+                                    {a.customerPhone && (
+                                      <div style={{ fontSize: t.fs.xs, color: t.textMuted, fontWeight: 400 }}>{a.customerPhone}</div>
+                                    )}
+                                  </td>
+                                  <td style={{ padding: "10px" }}>{svcIcon(a.service)} {a.service}</td>
+                                  <td style={{ padding: "10px", color: t.textMuted }}>{a.soldDate}</td>
+                                  <td style={{ padding: "10px", fontWeight: 600 }}>{a.renewDate}</td>
+                                  <td style={{ padding: "10px", fontWeight: 700, color: c }}>
+                                    {timeLeftLabel(a)}
+                                    {!a.renewed && (
+                                      <div style={{ height: 4, background: t.border, borderRadius: 2, overflow: "hidden", marginTop: 4, maxWidth: 120 }}>
+                                        <div style={{ height: "100%", width: a.pct + "%", background: c }} />
+                                      </div>
+                                    )}
+                                    {a.renewed && a.renewedAt && (
+                                      <div style={{ fontSize: t.fs.xs, fontWeight: 400, color: t.textMuted }}>
+                                        {new Date(a.renewedAt).toLocaleDateString()}
+                                      </div>
+                                    )}
+                                  </td>
+                                  <td style={{ padding: "10px", color: a.renewed ? t.textMuted : t.success }}>
+                                    {a.price} {a.currency || "EGP"}
+                                  </td>
+                                  <td style={{ padding: "10px", whiteSpace: "nowrap" }}>
+                                    {!a.renewed && (
+                                      <div style={{ display: "flex", gap: 4 }}>
+                                        {a.customerPhone && (
+                                          <a
+                                            href={waLink(a.customerPhone, remindMsg(a))}
+                                            target="_blank" rel="noreferrer"
+                                            style={{ ...t.btnWA, padding: "4px 10px", fontSize: t.fs.xs, minHeight: 28 }}
+                                          >📱</a>
+                                        )}
+                                        {canEditSale(a) && (
+                                          <button
+                                            onClick={() => renewSale(a)}
+                                            style={{ ...t.btnPrimary, background: t.success, padding: "4px 10px", fontSize: t.fs.xs, minHeight: 28 }}
+                                          >✓</button>
+                                        )}
+                                      </div>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </Fragment>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         {/* ═══════════════════════════════════════════════════════════════
              📦 BUNDLES TAB (admin only)
