@@ -4305,7 +4305,11 @@ export default function App() {
               <div>
                 <div style={{ fontWeight: 700, fontSize: 14 }}>ProSkill</div>
                 <div style={{ fontSize: 8, color: "#2a9d8f", fontWeight: 600, letterSpacing: 1.5 }}>DIGITAL AGENCY</div>
-                <div style={{ fontSize: 8, color: "#f59e0b", fontWeight: 700 }}>{BUILD_TAG}</div>
+                <div style={{
+                  fontSize: 10, color: "#0f172a", fontWeight: 800,
+                  background: "#f59e0b", borderRadius: 4,
+                  padding: "1px 6px", marginTop: 2, display: "inline-block",
+                }}>{BUILD_TAG}</div>
               </div>
             )}
           </div>
@@ -4345,7 +4349,7 @@ export default function App() {
           )}
 
           {/* Tab list */}
-          <div style={{ flex: 1, padding: "4px 0", overflowY: "auto" }}>
+          <div style={{ flex: 1, padding: "4px 0", overflowY: "auto", position: "relative" }}>
             {visTabs.map(tb => {
               const active = tab === tb.id;
               return (
@@ -4354,17 +4358,17 @@ export default function App() {
                   onClick={() => setTab(tb.id)}
                   style={{
                     display: "flex", alignItems: "center", gap: 10,
-                    padding: sideOpen ? "10px 14px" : "10px 18px",
+                    padding: sideOpen ? "7px 14px" : "7px 18px",
                     cursor: "pointer",
                     background: active ? "rgba(42,157,143,0.18)" : "transparent",
                     borderLeft: active ? "3px solid #2a9d8f" : "3px solid transparent",
                     color: active ? "#fff" : "#94a3b8",
                     fontSize: 12,
                     fontWeight: active ? 700 : 500,
-                    minHeight: 40,
+                    minHeight: 34,
                   }}
                 >
-                  <span style={{ fontSize: 16, flexShrink: 0 }}>{tb.icon}</span>
+                  <span style={{ fontSize: 15, flexShrink: 0 }}>{tb.icon}</span>
                   {sideOpen && <span>{tb.label}</span>}
                   {sideOpen && tb.id === "tasks" && overdueTasks.length > 0 && (
                     <span style={{
