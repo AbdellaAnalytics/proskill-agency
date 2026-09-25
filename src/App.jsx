@@ -1368,6 +1368,28 @@ export default function App() {
   // For simplicity: admin's workspace is keyed by admin's user_id. Members' clients try loading
   // their own workspace first, then fall back to a pre-known admin workspace.
   // The cleanest approach: store adminUserId in localStorage when admin first logs in.
+  // Load the workspace, retrying before giving up.
+  // A single failed request is normal — an expired token right after a deploy,
+  // a dropped connection, a cold start. Blocking the app on the first miss is
+  // what turned a two-second hiccup into an empty screen.
+  const loadWithRetry = async (fetchFn, label) => {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const d = await fetchFn();
+      if (d) return d;
+      // A failed REQUEST (not an empty workspace) is worth retrying.
+      if (sb.lastLoadOk) return null; // request succeeded, there is genuinely no row
+      if (attempt < 3) {
+        console.warn("[ProSkill] " + label + " attempt " + attempt + " failed — refreshing token and retrying…");
+        try {
+          const rt = localStorage.getItem("ps_r");
+          if (rt) await sb.refresh(rt);
+        } catch {}
+        await new Promise(r => setTimeout(r, attempt * 800));
+      }
+    }
+    return null;
+  };
+
   const loadWorkspace = async (user) => {
     setLoaded(false);
     try {
@@ -1375,7 +1397,7 @@ export default function App() {
       if ((user.email || "").toLowerCase() === ADMIN_EMAIL.toLowerCase()) {
         setWorkspaceOwnerId(user.id);
         try { localStorage.setItem("ps_admin_id", user.id); } catch {}
-        let d = await sb.loadData(user.id);
+        let d = await loadWithRetry(() => sb.loadData(user.id), "admin workspace");
         // Fallback to localStorage backup if cloud load failed/empty
         if (!d) {
           try {
@@ -1394,7 +1416,7 @@ export default function App() {
         return;
       }
       // Member: find admin's workspace using the well-known ADMIN_EMAIL key (works across devices)
-      const byEmail = await sb.loadAdminWorkspaceByEmail(ADMIN_EMAIL);
+      const byEmail = await loadWithRetry(() => sb.loadAdminWorkspaceByEmail(ADMIN_EMAIL), "shared workspace");
       if (byEmail && byEmail.ownerId) {
         setWorkspaceOwnerId(byEmail.ownerId);
         try { localStorage.setItem("ps_admin_id", byEmail.ownerId); } catch {}
@@ -1419,7 +1441,7 @@ export default function App() {
       const adminId = localStorage.getItem("ps_admin_id");
       if (adminId) {
         setWorkspaceOwnerId(adminId);
-        let d = await sb.loadData(adminId);
+        let d = await loadWithRetry(() => sb.loadData(adminId), "legacy workspace");
         if (!d) {
           try {
             const backup = localStorage.getItem("ps_backup_" + adminId);
@@ -1451,13 +1473,17 @@ export default function App() {
         loadSucceededRef.current = true;
         console.log("[ProSkill] No workspace found — starting a fresh one.");
       } else {
-        console.error("[ProSkill] ⛔ Workspace did not load. Saving is disabled to protect your data.");
+        console.error("[ProSkill] ⛔ Workspace did not load after 3 attempts. Saving is disabled to protect your data.");
         setSyncStatus("error");
-        alert(
-          "⚠️ Could not load your workspace.\n\n" +
-          "Saving has been DISABLED so your existing data is not overwritten.\n\n" +
-          "Check your connection and reload the page. Do not enter anything until the data appears."
+        // Offer the fix instead of describing it. Declining leaves the app in a
+        // safe read-only state rather than a dead end.
+        const again = confirm(
+          "⚠️ Couldn't load your workspace after 3 tries.\n\n" +
+          "Your data is safe in the cloud — this session just can't read it, " +
+          "so saving is switched off to protect it.\n\n" +
+          "Press OK to reload and try again."
         );
+        if (again) { window.location.reload(); return; }
       }
     } else if (restoredFromBackupRef.current) {
       setSyncStatus("error");
@@ -4175,7 +4201,7 @@ export default function App() {
   const syncColor = syncStatus === "saved" ? t.success : syncStatus === "saving" ? t.warning : t.danger;
   const syncLabel = syncStatus === "saved" ? "☁️ Synced"
     : syncStatus === "saving" ? "Saving..."
-    : saveBlocked ? "🛑 Saving OFF — reload"
+    : saveBlocked ? "🛑 Saving off — tap to reload"
     : "⚠️ Will retry";
 
   // ═══ Warn user if they try to close tab while saves are pending ═══
@@ -4197,7 +4223,18 @@ export default function App() {
     // Same guards as the autosave. This button is reachable exactly when a load
     // has failed, so without them one tap would push the empty state to the cloud.
     const gate = canSaveNow();
-    if (!gate.ok) { alert("⚠️ Sync blocked\n\n" + gate.reason); return; }
+    if (!gate.ok) {
+      // Tapping the banner is the one action available here, so it must lead
+      // somewhere. Repeating the same error is a dead end.
+      if (!loadSucceededRef.current) {
+        if (confirm("⚠️ Sync blocked\n\n" + gate.reason + "\n\nPress OK to reload and try again.")) {
+          window.location.reload();
+        }
+        return;
+      }
+      alert("⚠️ Sync blocked\n\n" + gate.reason);
+      return;
+    }
     rememberGoodCounts();
     const dataToSave = {
       services, sales, sConf, stockRows, guides, checklist, customers, logs,
