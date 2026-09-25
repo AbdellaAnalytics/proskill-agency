@@ -360,7 +360,7 @@ const sb = {
 // ═══════════════════════════════════════════════════════════════════
 const ADMIN_EMAIL = "Mohamed.abdullah969@gmail.com";
 const ADMIN_WA = "201270935507";
-const BUILD_TAG = "v6 · 25 Sep";  // shown under the logo so it is obvious which build is live
+const BUILD_TAG = "v7.1 · 25 Sep";  // shown under the logo so it is obvious which build is live
 // LinkedIn brand blue — used so its alerts stand apart from the amber/red ones.
 const LI_BLUE = "#0a66c2";
 // Any service whose name mentions LinkedIn counts, so "LinkedIn verification"
@@ -2139,13 +2139,64 @@ export default function App() {
     addLog("✎ Edited: " + editSale.customer);
   };
 
+  // ─── Close a renewal without the Renew form ───
+  // "Mark renewed" is for a renewal that is already recorded (or was done outside
+  // the app). It creates NO sale, so it is flagged renewedManually — that flag is
+  // what allows undoing it later, and it keeps it apart from a Renew-button
+  // renewal, whose follow-on sale would be orphaned by an undo.
+  const markRenewedOnly = (a) => {
+    if (!canEditSale(a)) return;
+    if (!confirm("Mark " + a.customer + " (" + a.service + ") as renewed?\n\n"
+      + "This does NOT create a new sale or add any revenue.\n"
+      + "Use it only if the renewal sale is already recorded, or you renewed it outside the app.")) return;
+    setSales(p => p.map(x => x.id === a.id
+      ? { ...x, renewedAt: new Date().toISOString(), renewedBy: cU ? cU.name : "?", renewedManually: true,
+          renewalDismissedAt: null, renewalDismissedBy: null, renewalDismissReason: null }
+      : x));
+    addLog("☑️ Marked renewed (no new sale): " + a.customer + " " + a.service);
+  };
+  // "Dismiss" = the customer is not renewing. It stops the reminders and alerts,
+  // but it still counts AGAINST the renewal rate — a lost customer is a lost
+  // renewal, and hiding it would make the rate look better than it is.
+  const dismissRenewal = (a) => {
+    if (!canEditSale(a)) return;
+    const reason = prompt("Dismiss " + a.customer + " (" + a.service + ") — not renewing.\n\nReason (optional):", "");
+    if (reason === null) return; // Cancel
+    setSales(p => p.map(x => x.id === a.id
+      ? { ...x, renewalDismissedAt: new Date().toISOString(), renewalDismissedBy: cU ? cU.name : "?",
+          renewalDismissReason: reason.trim() || null }
+      : x));
+    addLog("🚫 Won't renew: " + a.customer + " " + a.service + (reason.trim() ? " — " + reason.trim() : ""));
+  };
+  // Undo only what these two buttons did. A Renew-button renewal is left alone.
+  const undoRenewalClose = (a) => {
+    if (!canEditSale(a)) return;
+    setSales(p => p.map(x => {
+      if (x.id !== a.id) return x;
+      if (x.renewalDismissedAt) return { ...x, renewalDismissedAt: null, renewalDismissedBy: null, renewalDismissReason: null };
+      if (x.renewedManually) return { ...x, renewedAt: null, renewedBy: null, renewedManually: false };
+      return x;
+    }));
+    addLog("↺ Reopened renewal: " + a.customer + " " + a.service);
+  };
+
   const renewSale = (s) => {
     // Stamp the old sale. Without this it stays "expired" forever: it keeps
     // showing in the trackers and keeps firing renewal alerts even though the
     // customer has already renewed. renewedAt is cleared if the new sale is
     // never actually saved (see the cancel path in the sale form).
+    //
+    // renewedManually is cleared: this renewal now has a real follow-on sale, so
+    // the Undo button must not appear on it (undoing would orphan that sale).
+    // The previous state is kept so Cancel can put back exactly what was there —
+    // a sale already marked renewed must not be reopened by a cancelled form.
+    const renewalPrev = {
+      renewedAt: s.renewedAt || null,
+      renewedBy: s.renewedBy || null,
+      renewedManually: !!s.renewedManually,
+    };
     setSales(p => p.map(x => x.id === s.id
-      ? { ...x, renewedAt: new Date().toISOString(), renewedBy: cU ? cU.name : "?" }
+      ? { ...x, renewedAt: new Date().toISOString(), renewedBy: cU ? cU.name : "?", renewedManually: false }
       : x));
     setNewSale({
       service: s.service,
@@ -2161,6 +2212,7 @@ export default function App() {
       assignedTo: s.assignedTo || null,
       vendor: s.vendor || "",
       renewalOf: s.id,
+      renewalPrev,
     });
     setTab("sales_entry");
   };
@@ -3803,8 +3855,10 @@ export default function App() {
         const days = a.renewDate ? daysLeft(a.renewDate) : null;
         // Already renewed into a follow-on sale — no longer a live subscription
         const renewed = !!a.renewedAt;
+        // Dismissed from Renewals = customer is not renewing; it stops expiring here too.
+        const dismissed = !renewed && !!a.renewalDismissedAt;
         // period 0 = one-off (e.g. verification), -1 = lifetime — neither expires
-        const recurring = a.period > 0 && !!a.renewDate && !renewed;
+        const recurring = a.period > 0 && !!a.renewDate && !renewed && !dismissed;
         let status = "one_time";
         if (renewed) status = "renewed";
         else if (a.period === -1) status = "lifetime";
@@ -3815,7 +3869,8 @@ export default function App() {
           else if (days <= 7) status = "soon";
           else status = "active";
         }
-        return { ...a, daysUntil: days, recurring, renewed, liStatus: status };
+        if (dismissed) status = "dismissed";
+        return { ...a, daysUntil: days, recurring, renewed, dismissed, liStatus: status };
       })
       .sort((a, b) => {
         // Expiring first; non-recurring sink to the bottom
@@ -3836,9 +3891,12 @@ export default function App() {
       .map(a => {
         const days = daysLeft(a.renewDate);
         const renewed = !!a.renewedAt;
+        const dismissed = !renewed && !!a.renewalDismissedAt;
+        const closed = renewed || dismissed;
         // Urgency band drives grouping, colour and the action strip.
         let band;
         if (renewed) band = "renewed";
+        else if (dismissed) band = "dismissed";
         else if (days < 0) band = "late";
         else if (days <= 7) band = "week";
         else if (days <= 30) band = "month";
@@ -3847,15 +3905,17 @@ export default function App() {
           ...a,
           daysUntil: days,
           renewed,
+          dismissed,
+          closed,
           band,
-          isOverdue: !renewed && days < 0,
-          isExpired: !renewed && days < 0,
-          needsReminder: !renewed && days >= 0 && days <= 2,
-          isUpcoming: !renewed && days > 2 && days <= 30,
-          status: renewed ? "Renewed" : (days < 0 ? "Overdue" : "Pending"),
+          isOverdue: !closed && days < 0,
+          isExpired: !closed && days < 0,
+          needsReminder: !closed && days >= 0 && days <= 2,
+          isUpcoming: !closed && days > 2 && days <= 30,
+          status: renewed ? "Renewed" : dismissed ? "Won't renew" : (days < 0 ? "Overdue" : "Pending"),
           // How much of the term has elapsed, for the little progress bar.
           pct: (() => {
-            if (renewed) return 100;
+            if (closed) return 100;
             const total = (a.period || 1) * 30;
             const used = total - days;
             return Math.max(0, Math.min(100, Math.round((used / total) * 100)));
@@ -3874,7 +3934,7 @@ export default function App() {
   // Everything that needs a message today: already late, or due within 1 day.
   const renDueNow = useMemo(
     () => renewalsList
-      .filter(a => !a.renewed && a.daysUntil <= 1)
+      .filter(a => !a.closed && a.daysUntil <= 1)
       .sort((x, y) => x.daysUntil - y.daysUntil),
     [renewalsList]
   );
@@ -3887,6 +3947,7 @@ export default function App() {
     const month = renewalsList.filter(a => a.band === "month");
     const later = renewalsList.filter(a => a.band === "later");
     const renewedList = renewalsList.filter(a => a.renewed);
+    const dismissedList = renewalsList.filter(a => a.dismissed);
     // Renewal rate: of the subscriptions that came due in the last 30 days, how
     // many were renewed. Deliberately keyed on the expiry date, not on when the
     // Renew button was pressed — a sale renewed late still counts for the month
@@ -3899,7 +3960,7 @@ export default function App() {
       (a.renewDate || "") >= cutoff && (a.renewDate || "") <= graceCut);
     const keptRecently = dueRecently.filter(a => a.renewed);
     return {
-      late, week, month, later, renewedList,
+      late, week, month, later, renewedList, dismissedList,
       lateVal: sum(late), weekVal: sum(week), monthVal: sum(month), laterVal: sum(later),
       dueNowVal: sum(renDueNow),
       rate: dueRecently.length > 0 ? Math.round((keptRecently.length / dueRecently.length) * 100) : null,
@@ -3922,16 +3983,17 @@ export default function App() {
     if (renProduct !== "all") list = list.filter(a => a.service === renProduct);
     // Band filters. "all" hides renewed rows — they are history, and leaving them
     // in the default view is what made the old tab look full of dead entries.
-    if (renFilter === "all") list = list.filter(a => !a.renewed);
+    if (renFilter === "all") list = list.filter(a => !a.closed);
     else if (renFilter === "late") list = list.filter(a => a.band === "late");
     else if (renFilter === "week") list = list.filter(a => a.band === "week");
     else if (renFilter === "month") list = list.filter(a => a.band === "month");
     else if (renFilter === "later") list = list.filter(a => a.band === "later");
     else if (renFilter === "renewed") list = list.filter(a => a.renewed);
+    else if (renFilter === "dismissed") list = list.filter(a => a.dismissed);
     // Legacy filter ids kept working so nothing breaks if one is still stored
     else if (renFilter === "overdue" || renFilter === "expired") list = list.filter(a => a.band === "late");
-    else if (renFilter === "due") list = list.filter(a => !a.renewed && a.needsReminder);
-    else if (renFilter === "upcoming") list = list.filter(a => !a.renewed && a.isUpcoming);
+    else if (renFilter === "due") list = list.filter(a => !a.closed && a.needsReminder);
+    else if (renFilter === "upcoming") list = list.filter(a => !a.closed && a.isUpcoming);
     if (renDateFrom) list = list.filter(a => (a.renewDate || "") >= renDateFrom);
     if (renDateTo) list = list.filter(a => (a.renewDate || "") <= renDateTo);
     // Sort
@@ -3998,7 +4060,7 @@ export default function App() {
     const baseSales = isAdmin ? sales : scopedSales;
     // Skip refunded and already-renewed sales: both have stopped being live
     // subscriptions, and nagging about them buries the alerts that matter.
-    const liveSubs = baseSales.filter(a => a.done && a.renewDate && !a.refunded && !a.renewedAt);
+    const liveSubs = baseSales.filter(a => a.done && a.renewDate && !a.refunded && !a.renewedAt && !a.renewalDismissedAt);
     const rn = liveSubs.filter(a => a.renewDate === t0 || a.renewDate === tmr);
     const ex = liveSubs.filter(a => daysLeft(a.renewDate) < 0);
     const pp = baseSales.filter(a => {
@@ -4023,7 +4085,7 @@ export default function App() {
     // 💼 LinkedIn — one day before expiry and on the day itself.
     // Blue so it reads apart from the amber/red alerts at a glance.
     baseSales.forEach(a => {
-      if (!isLinkedInService(a.service) || !a.done || a.refunded || a.renewedAt) return;
+      if (!isLinkedInService(a.service) || !a.done || a.refunded || a.renewedAt || a.renewalDismissedAt) return;
       if (!(a.period > 0) || !a.renewDate) return;
       const d = daysLeft(a.renewDate);
       if (d !== 0 && d !== 1) return;
@@ -7479,9 +7541,9 @@ export default function App() {
                       // from the trackers without a renewal ever being recorded.
                       const origId = newSale && newSale.renewalOf;
                       if (origId) {
-                        setSales(p => p.map(x => x.id === origId
-                          ? { ...x, renewedAt: null, renewedBy: null }
-                          : x));
+                        const prev = (newSale && newSale.renewalPrev)
+                          || { renewedAt: null, renewedBy: null, renewedManually: false };
+                        setSales(p => p.map(x => x.id === origId ? { ...x, ...prev } : x));
                       }
                       setNewSale(null);
                     }}
@@ -9133,7 +9195,7 @@ export default function App() {
             if (liFilter === "expiring") { if (!(a.recurring && a.daysUntil >= 0 && a.daysUntil <= 7)) return false; }
             else if (liFilter === "expired") { if (!(a.recurring && a.daysUntil < 0)) return false; }
             else if (liFilter === "active") { if (!(a.recurring && a.daysUntil > 7)) return false; }
-            else if (liFilter === "onetime") { if (a.recurring || a.renewed) return false; }
+            else if (liFilter === "onetime") { if (a.recurring || a.renewed || a.dismissed) return false; }
             else if (liFilter === "renewed") { if (!a.renewed) return false; }
             if (liFrom && (a.renewDate || "") < liFrom) return false;
             if (liTo && (a.renewDate || "") > liTo) return false;
@@ -9298,6 +9360,7 @@ export default function App() {
                         <div style={{ textAlign: "right", flexShrink: 0 }}>
                           <div style={{ fontSize: t.fs.sm, fontWeight: 700, color: c }}>
                             {a.renewed ? "🔄 Renewed"
+                              : a.dismissed ? "🚫 Won't renew"
                               : !a.recurring ? (a.period === -1 ? "♾️ Lifetime" : "⚪ One-time")
                               : a.daysUntil < 0 ? Math.abs(a.daysUntil) + "d ago"
                               : a.daysUntil + "d left"}
@@ -9349,6 +9412,7 @@ export default function App() {
                               <td style={{ padding: "10px 12px", fontWeight: 600 }}>{a.renewDate || "—"}</td>
                               <td style={{ padding: "10px 12px", fontWeight: 700, color: c }}>
                                 {a.renewed ? "🔄 Renewed"
+                                  : a.dismissed ? "🚫 Won't renew"
                                   : !a.recurring ? "—"
                                   : a.daysUntil < 0 ? Math.abs(a.daysUntil) + "d ago"
                                   : a.daysUntil + "d"}
@@ -9827,10 +9891,11 @@ export default function App() {
           const bandColor = (b) => b === "late" ? t.danger
             : b === "week" ? "#f97316"
             : b === "month" ? t.warning
-            : b === "renewed" ? t.textMuted
+            : b === "renewed" || b === "dismissed" ? t.textMuted
             : t.success;
 
           const timeLeftLabel = (a) => a.renewed ? "🔄 Renewed"
+            : a.dismissed ? "🚫 Won't renew"
             : a.daysUntil < 0 ? Math.abs(a.daysUntil) + (Math.abs(a.daysUntil) === 1 ? " day late" : " days late")
             : a.daysUntil === 0 ? "Today"
             : a.daysUntil === 1 ? "Tomorrow"
@@ -9844,8 +9909,9 @@ export default function App() {
             month:  { icon: "🟡", text: "Later this month" },
             later:  { icon: "🟢", text: "Beyond this month" },
             renewed:{ icon: "🔄", text: "Renewed" },
+            dismissed:{ icon: "🚫", text: "Won't renew" },
           };
-          const grouped = ["late", "week", "month", "later", "renewed"]
+          const grouped = ["late", "week", "month", "later", "renewed", "dismissed"]
             .map(b => ({ band: b, rows: renFilteredList.filter(r => r.band === b) }))
             .filter(g => g.rows.length > 0);
           const showHeadings = grouped.length > 1;
@@ -9879,14 +9945,14 @@ export default function App() {
                   onCsv={() => exportCSV(renFilteredList.map(a => ({
                     Customer: a.customer, Phone: a.customerPhone || "", Service: a.service,
                     Started: a.soldDate, Expires: a.renewDate, Period: a.period,
-                    DaysLeft: a.renewed ? "" : a.daysUntil,
-                    Status: a.renewed ? "Renewed" : a.band,
+                    DaysLeft: a.closed ? "" : a.daysUntil,
+                    Status: a.renewed ? "Renewed" : a.dismissed ? "Won't renew" : a.band,
                     Value: a.price, Currency: a.currency || "EGP",
                   })), "renewals_" + todayStr() + ".csv")}
                   onXlsx={() => exportExcel(renFilteredList.map(a => ({
                     Customer: a.customer, Phone: a.customerPhone || "", Service: a.service,
                     Started: a.soldDate, Expires: a.renewDate,
-                    DaysLeft: a.renewed ? "" : a.daysUntil, Value: a.price,
+                    DaysLeft: a.closed ? "" : a.daysUntil, Value: a.price,
                   })), "renewals_" + todayStr() + ".xls", "Renewals")}
                   onPdf={() => exportPDF("Renewals", renFilteredList.map(a => ({
                     Customer: a.customer, Service: a.service,
@@ -9947,7 +10013,7 @@ export default function App() {
                           <div style={{ fontSize: t.fs.sm, fontWeight: 700, color: c }}>{timeLeftLabel(a)}</div>
                           <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>{a.renewDate}</div>
                         </div>
-                        <div style={{ display: "flex", gap: 6 }}>
+                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                           {a.customerPhone && (
                             <a
                               href={waLink(a.customerPhone, remindMsg(a))}
@@ -9960,6 +10026,20 @@ export default function App() {
                               onClick={() => renewSale(a)}
                               style={{ ...t.btnPrimary, background: t.success, padding: "6px 12px", fontSize: t.fs.xs, minHeight: 32 }}
                             >✓ Renew</button>
+                          )}
+                          {canEditSale(a) && (
+                            <button
+                              onClick={() => markRenewedOnly(a)}
+                              title="Already renewed — no new sale"
+                              style={{ ...t.btnGhost, padding: "6px 10px", fontSize: t.fs.xs, minHeight: 32 }}
+                            >☑️ Mark renewed</button>
+                          )}
+                          {canEditSale(a) && (
+                            <button
+                              onClick={() => dismissRenewal(a)}
+                              title="Customer is not renewing"
+                              style={{ ...t.btnGhost, padding: "6px 10px", fontSize: t.fs.xs, minHeight: 32, color: t.danger }}
+                            >🚫 Dismiss</button>
                           )}
                         </div>
                       </div>
@@ -10031,11 +10111,12 @@ export default function App() {
                 </div>
                 <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
                   {[
-                    { id: "all",     l: "Upcoming " + renewalsList.filter(a => !a.renewed).length },
+                    { id: "all",     l: "Upcoming " + renewalsList.filter(a => !a.closed).length },
                     { id: "late",    l: "🔴 Late " + renStats.late.length },
                     { id: "week",    l: "🟠 Next 7 days " + renStats.week.length },
                     { id: "later",   l: "🟢 Beyond " + renStats.later.length },
                     { id: "renewed", l: "🔄 Renewed " + renStats.renewedList.length },
+                    { id: "dismissed", l: "🚫 Won't renew " + renStats.dismissedList.length },
                   ].map(c => (
                     <span
                       key={c.id}
@@ -10089,7 +10170,7 @@ export default function App() {
                         <div key={a.id} style={{
                           ...t.card, marginBottom: 10, padding: 14,
                           borderLeft: "3px solid " + c,
-                          opacity: a.renewed ? 0.55 : 1,
+                          opacity: a.closed ? 0.55 : 1,
                         }}>
                           <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 6 }}>
                             <div style={{ minWidth: 0, flex: 1 }}>
@@ -10103,7 +10184,7 @@ export default function App() {
                               <div style={{ fontSize: t.fs.xs, color: t.textMuted }}>{a.renewDate}</div>
                             </div>
                           </div>
-                          {!a.renewed && (
+                          {!a.closed && (
                             <div style={{ height: 4, background: t.border, borderRadius: 2, overflow: "hidden", marginBottom: 8 }}>
                               <div style={{ height: "100%", width: a.pct + "%", background: c }} />
                             </div>
@@ -10117,7 +10198,14 @@ export default function App() {
                               {a.renewedBy ? " by " + a.renewedBy : ""}
                             </div>
                           )}
-                          {!a.renewed && (
+                          {a.dismissed && (
+                            <div style={{ fontSize: t.fs.xs, color: t.textMuted, marginTop: 4 }}>
+                              🚫 Won't renew · {new Date(a.renewalDismissedAt).toLocaleDateString()}
+                              {a.renewalDismissedBy ? " by " + a.renewalDismissedBy : ""}
+                              {a.renewalDismissReason ? " — " + a.renewalDismissReason : ""}
+                            </div>
+                          )}
+                          {!a.closed && (
                             <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
                               {a.customerPhone && (
                                 <a
@@ -10133,6 +10221,24 @@ export default function App() {
                                 >✓ Renew</button>
                               )}
                             </div>
+                          )}
+                          {!a.closed && canEditSale(a) && (
+                            <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                              <button
+                                onClick={() => markRenewedOnly(a)}
+                                style={{ ...t.btnGhost, flex: 1, fontSize: t.fs.sm }}
+                              >☑️ Mark renewed</button>
+                              <button
+                                onClick={() => dismissRenewal(a)}
+                                style={{ ...t.btnGhost, flex: 1, fontSize: t.fs.sm, color: t.danger }}
+                              >🚫 Dismiss</button>
+                            </div>
+                          )}
+                          {(a.dismissed || (a.renewed && a.renewedManually)) && canEditSale(a) && (
+                            <button
+                              onClick={() => undoRenewalClose(a)}
+                              style={{ ...t.btnGhost, width: "100%", marginTop: 8, fontSize: t.fs.sm }}
+                            >↺ Undo</button>
                           )}
                         </div>
                       );
@@ -10176,7 +10282,7 @@ export default function App() {
                                 <tr key={a.id} style={{
                                   borderBottom: "1px solid " + t.border,
                                   background: rowBg,
-                                  opacity: a.renewed ? 0.55 : 1,
+                                  opacity: a.closed ? 0.55 : 1,
                                 }}>
                                   <td style={{ padding: "10px", cursor: "pointer" }} onClick={() => setSelSale(a)}>
                                     <strong>{a.customer}</strong>
@@ -10189,7 +10295,7 @@ export default function App() {
                                   <td style={{ padding: "10px", fontWeight: 600 }}>{a.renewDate}</td>
                                   <td style={{ padding: "10px", fontWeight: 700, color: c }}>
                                     {timeLeftLabel(a)}
-                                    {!a.renewed && (
+                                    {!a.closed && (
                                       <div style={{ height: 4, background: t.border, borderRadius: 2, overflow: "hidden", marginTop: 4, maxWidth: 120 }}>
                                         <div style={{ height: "100%", width: a.pct + "%", background: c }} />
                                       </div>
@@ -10199,12 +10305,18 @@ export default function App() {
                                         {new Date(a.renewedAt).toLocaleDateString()}
                                       </div>
                                     )}
+                                    {a.dismissed && (
+                                      <div style={{ fontSize: t.fs.xs, fontWeight: 400, color: t.textMuted }}>
+                                        {new Date(a.renewalDismissedAt).toLocaleDateString()}
+                                        {a.renewalDismissReason ? " — " + a.renewalDismissReason : ""}
+                                      </div>
+                                    )}
                                   </td>
-                                  <td style={{ padding: "10px", color: a.renewed ? t.textMuted : t.success }}>
+                                  <td style={{ padding: "10px", color: a.closed ? t.textMuted : t.success }}>
                                     {a.price} {a.currency || "EGP"}
                                   </td>
                                   <td style={{ padding: "10px", whiteSpace: "nowrap" }}>
-                                    {!a.renewed && (
+                                    {!a.closed && (
                                       <div style={{ display: "flex", gap: 4 }}>
                                         {a.customerPhone && (
                                           <a
@@ -10216,10 +10328,32 @@ export default function App() {
                                         {canEditSale(a) && (
                                           <button
                                             onClick={() => renewSale(a)}
+                                            title="Renew — opens a new sale"
                                             style={{ ...t.btnPrimary, background: t.success, padding: "4px 10px", fontSize: t.fs.xs, minHeight: 28 }}
                                           >✓</button>
                                         )}
+                                        {canEditSale(a) && (
+                                          <button
+                                            onClick={() => markRenewedOnly(a)}
+                                            title="Mark renewed — already recorded, no new sale"
+                                            style={{ ...t.btnGhost, padding: "4px 8px", fontSize: t.fs.xs, minHeight: 28 }}
+                                          >☑️</button>
+                                        )}
+                                        {canEditSale(a) && (
+                                          <button
+                                            onClick={() => dismissRenewal(a)}
+                                            title="Dismiss — customer is not renewing"
+                                            style={{ ...t.btnGhost, padding: "4px 8px", fontSize: t.fs.xs, minHeight: 28 }}
+                                          >🚫</button>
+                                        )}
                                       </div>
+                                    )}
+                                    {(a.dismissed || (a.renewed && a.renewedManually)) && canEditSale(a) && (
+                                      <button
+                                        onClick={() => undoRenewalClose(a)}
+                                        title="Undo"
+                                        style={{ ...t.btnGhost, padding: "4px 10px", fontSize: t.fs.xs, minHeight: 28 }}
+                                      >↺ Undo</button>
                                     )}
                                   </td>
                                 </tr>
@@ -14193,7 +14327,12 @@ export default function App() {
               borderRadius: 2, margin: "0 auto 20px",
             }} />
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-              <h3 style={{ margin: 0, fontSize: t.fs.lg, fontWeight: 700 }}>All Sections</h3>
+              <h3 style={{ margin: 0, fontSize: t.fs.lg, fontWeight: 700 }}>
+                All Sections{" "}
+                {/* Same tag as the desktop sidebar, so a phone can tell which build it runs */}
+                <span style={{ fontSize: 10, color: "#0f172a", fontWeight: 800, background: "#f59e0b",
+                               borderRadius: 4, padding: "1px 6px", verticalAlign: "middle" }}>{BUILD_TAG}</span>
+              </h3>
               <span
                 onClick={() => setShowMoreMenu(false)}
                 style={{ fontSize: 24, color: t.textMuted, cursor: "pointer", padding: 4 }}
