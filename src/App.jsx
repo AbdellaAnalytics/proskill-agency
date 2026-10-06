@@ -304,11 +304,18 @@ const sb = {
       if (r.ok) {
         // PATCH with return=minimal returns empty response on success
         // Check count in response headers would be ideal; for now assume success if 2xx
-        if (adminEmail) {
+        if (adminEmail && this.hasTeam(data)) {
           this.upsertEmailIndex(workspaceOwnerId, data, adminEmail).catch(() => {});
         }
         console.log("[ProSkill] ✅ Save OK (PATCH status " + r.status + ")");
         return { ok: true };
+      }
+      // Server down (0 / 5xx) or auth refused (401 / 403): an INSERT cannot
+      // succeed either, and it is another full-size upload into a database
+      // that is already failing. Report the failure and let the backoff wait.
+      if (r.status === 0 || r.status === 401 || r.status === 403 || r.status >= 500) {
+        console.error("[ProSkill] ❌ Save failed. PATCH:", r.status, "(no INSERT attempted)");
+        return { ok: false, status: r.status };
       }
       // If PATCH failed with anything other than "no rows", it's a real error
       console.warn("[ProSkill] PATCH failed with status", r.status, "- trying INSERT");
@@ -317,7 +324,7 @@ const sb = {
         { method: "POST", prefer: "return=minimal", body: JSON.stringify({ owner_id: workspaceOwnerId, workspace_key: key, data: slimData }) }
       );
       if (r2.ok) {
-        if (adminEmail) {
+        if (adminEmail && this.hasTeam(data)) {
           this.upsertEmailIndex(workspaceOwnerId, data, adminEmail).catch(() => {});
         }
         console.log("[ProSkill] ✅ Save OK (INSERT status " + r2.status + ")");
@@ -326,7 +333,7 @@ const sb = {
       // 409 Conflict on INSERT means row exists — this is actually a success (PATCH should've caught it but race)
       if (r2.status === 409) {
         console.log("[ProSkill] ℹ️ 409 conflict but row exists — treating as success");
-        if (adminEmail) {
+        if (adminEmail && this.hasTeam(data)) {
           this.upsertEmailIndex(workspaceOwnerId, data, adminEmail).catch(() => {});
         }
         return { ok: true };
@@ -337,6 +344,11 @@ const sb = {
       console.error("[ProSkill] ❌ Save exception:", e.message);
       return { ok: false };
     }
+  },
+  // The email copy exists only so team members can find the workspace. With no
+  // team nobody reads it, and writing it doubled every save (~3 MB each).
+  hasTeam(data) {
+    return !!(data && Array.isArray(data.team) && data.team.length > 0);
   },
   // Helper: upsert the email-keyed index entry so members can discover admin's workspace
   async upsertEmailIndex(workspaceOwnerId, data, adminEmail) {
@@ -360,7 +372,7 @@ const sb = {
 // ═══════════════════════════════════════════════════════════════════
 const ADMIN_EMAIL = "Mohamed.abdullah969@gmail.com";
 const ADMIN_WA = "201270935507";
-const BUILD_TAG = "v7.1 · 25 Sep";  // shown under the logo so it is obvious which build is live
+const BUILD_TAG = "v9 · lean save";  // shown under the logo so it is obvious which build is live
 // LinkedIn brand blue — used so its alerts stand apart from the amber/red ones.
 const LI_BLUE = "#0a66c2";
 // Any service whose name mentions LinkedIn counts, so "LinkedIn verification"
@@ -1087,6 +1099,14 @@ function Chart({ data, height, color, theme }) {
 let saveTimer = null;
 let saveInFlight = false;
 let pendingData = null; // holds latest data waiting to save
+// Failed-save backoff. A failed save used to retry every 200 ms, forever, each
+// attempt a ~435 KB upload (plus a second ~435 KB INSERT). When the database
+// slowed down, that loop alone was enough to keep it down. Now each failure
+// doubles the wait: 5s, 10s, 20s, 40s, then once a minute.
+let saveFailures = 0;
+let retryTimer = null;
+let kickSave = null; // the latest doSave, so a retry or a tap reuses one save path
+const retryDelay = () => Math.min(60000, 5000 * 2 ** Math.max(0, saveFailures - 1));
 
 // END OF DROP 1
 // Foundation complete — next drop: main App component, state, auth screens
@@ -1427,7 +1447,17 @@ export default function App() {
       if (byEmail && byEmail.ownerId) {
         setWorkspaceOwnerId(byEmail.ownerId);
         try { localStorage.setItem("ps_admin_id", byEmail.ownerId); } catch {}
-        let d = byEmail.data;
+        // Read the owner's main row, not the email copy: the copy is written after
+        // the main save, best-effort, and can lag behind it (it was 19 sales behind
+        // on 7 Oct). A member saving a lagging copy would erase the newer sales.
+        let d = await loadWithRetry(() => sb.loadData(byEmail.ownerId), "owner workspace");
+        if (!d && byEmail.data) {
+          // Main row unreadable: show the copy, but treat it like a device backup —
+          // saving stays paused so a possibly-stale copy is never written back.
+          d = byEmail.data;
+          restoredFromBackupRef.current = true;
+          console.warn("[ProSkill] ⚠️ Showing the shared copy — main workspace unreadable. Saving is paused.");
+        }
         if (!d) {
           try {
             const backup = localStorage.getItem("ps_backup_" + byEmail.ownerId);
@@ -1561,6 +1591,9 @@ export default function App() {
     const gate = canSaveNow();
     if (!gate.ok) {
       console.error("[ProSkill] ⛔ Save blocked:", gate.reason);
+      // A retry queued before the block must not fire past it.
+      clearTimeout(retryTimer);
+      retryTimer = null;
       setSyncStatus("error");
       return;
     }
@@ -1591,20 +1624,28 @@ export default function App() {
     pendingData = dataToSave;
     setSyncStatus("saving");
 
-    // 3. Debounce: wait 1s after last change before hitting cloud (faster feel)
-    clearTimeout(saveTimer);
-    saveTimer = setTimeout(async () => {
+    // 3. One save routine for this render. Retries and the sync badge call the
+    //    latest one through kickSave instead of keeping loops of their own.
+    const scheduleRetry = () => {
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => { retryTimer = null; if (kickSave) kickSave(); }, retryDelay());
+    };
       const doSave = async () => {
         // Guard: only one save at a time, but ALWAYS process pendingData
         if (saveInFlight || !pendingData) return;
         saveInFlight = true;
-        // Safety: force-reset flag after 20s in case something goes badly wrong
-        const safetyReset = setTimeout(() => { saveInFlight = false; }, 20000);
+        // Safety: force-reset the flag if something hangs. It must outlast a real
+        // request (60 s timeout, plus a possible second call) — at 20 s it used to
+        // fire mid-request and let two full saves run at once.
+        const safetyReset = setTimeout(() => { saveInFlight = false; }, 130000);
         const snapshot = pendingData;
         pendingData = null;
         try {
           const r = await sb.saveData(workspaceOwnerId, snapshot, ADMIN_EMAIL);
           if (r.ok) {
+            saveFailures = 0;
+            clearTimeout(retryTimer);
+            retryTimer = null;
             if (!pendingData) setSyncStatus("saved");
             // Once a day, keep a dated copy. Only after a confirmed save, so a
             // snapshot can never capture a state the cloud rejected.
@@ -1615,21 +1656,38 @@ export default function App() {
                 .catch(() => { snapshotDayRef.current = null; });
             }
           } else {
+            saveFailures++;
             setSyncStatus("error");
             if (!pendingData) pendingData = snapshot;
           }
         } catch {
+          saveFailures++;
           setSyncStatus("error");
           if (!pendingData) pendingData = snapshot;
         } finally {
           clearTimeout(safetyReset);
           saveInFlight = false;
-          // If new changes arrived during save, save them now
           if (pendingData) {
-            setTimeout(doSave, 200);
+            // After a success: newer edits arrived mid-save, send them now.
+            // After a failure: wait — never hammer a database that is failing.
+            if (saveFailures === 0) setTimeout(doSave, 200);
+            else scheduleRetry();
           }
         }
       };
+    kickSave = doSave;
+
+    // While saves are failing, edits only update pendingData; the backoff timer
+    // sends the latest state when it fires. Saving on every keystroke here would
+    // undo the backoff.
+    clearTimeout(saveTimer);
+    if (saveFailures > 0) {
+      setSyncStatus("error");
+      if (!retryTimer) scheduleRetry();
+      return;
+    }
+    // Debounce: wait 1s after last change before hitting cloud (faster feel)
+    saveTimer = setTimeout(() => {
       // Even if a save is already in flight, trigger again shortly (it will early-exit if truly in flight)
       if (saveInFlight) {
         setTimeout(doSave, 500);
@@ -1644,27 +1702,8 @@ export default function App() {
     loaded, authStatus, workspaceOwnerId,
   ]);
 
-  // ═══ Retry failed saves periodically ═══
-  useEffect(() => {
-    if (syncStatus !== "error" || !loaded || !workspaceOwnerId) return;
-    if (!canSaveNow().ok) return; // never retry a save that is blocked on purpose
-    const retry = setTimeout(() => {
-      if (pendingData && !saveInFlight) {
-        saveInFlight = true;
-        const snapshot = pendingData;
-        pendingData = null;
-        sb.saveData(workspaceOwnerId, snapshot, ADMIN_EMAIL).then(r => {
-          saveInFlight = false;
-          if (r.ok) setSyncStatus(pendingData ? "saving" : "saved");
-          else { if (!pendingData) pendingData = snapshot; }
-        }).catch(() => {
-          saveInFlight = false;
-          if (!pendingData) pendingData = snapshot;
-        });
-      }
-    }, 8000); // retry every 8 seconds while in error state
-    return () => clearTimeout(retry);
-  }, [syncStatus, loaded, workspaceOwnerId]);
+  // Failed-save retries live in the autosave above (backoff via retryTimer).
+  // A second loop here used to send saves of its own on top of that one.
 
   // Reset current tab if it becomes invalid for the member
   useEffect(() => {
@@ -4465,16 +4504,14 @@ export default function App() {
       dark, comments, expenses, tasks, bundles, feedback, waTemplates, team,
       dismissedN, seenN, suppliers, adobeAccounts, adobeRentals, saleIntakes,
     };
+    // A tap is the user asking to try now: skip the remaining wait, but use
+    // the autosave's own save so a failure lands back on the backoff.
+    clearTimeout(retryTimer);
+    retryTimer = null;
+    saveFailures = 0;
+    pendingData = dataToSave;
     setSyncStatus("saving");
-    saveInFlight = true;
-    try {
-      const r = await sb.saveData(workspaceOwnerId, dataToSave, ADMIN_EMAIL);
-      setSyncStatus(r.ok ? "saved" : "error");
-    } catch {
-      setSyncStatus("error");
-    } finally {
-      saveInFlight = false;
-    }
+    if (kickSave) kickSave();
   }, [workspaceOwnerId, services, sales, sConf, stockRows, guides, checklist, customers, logs, dark, comments, expenses, tasks, bundles, feedback, waTemplates, team, dismissedN, seenN, suppliers, adobeAccounts, adobeRentals, saleIntakes]);
 
   // ═══════════════════════════════════════════════════════════════════
