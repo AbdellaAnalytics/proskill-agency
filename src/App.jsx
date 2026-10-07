@@ -259,14 +259,25 @@ const sb = {
     // every other device.
     if (Array.isArray(data.saleIntakes)) {
       slim.saleIntakes = data.saleIntakes.map(intake => {
-        if (!intake || !Array.isArray(intake.images)) return intake;
-        if (!intake.images.some(img => img && img.base64)) return intake; // nothing to strip
-        return {
-          ...intake,
-          images: intake.images.map(img => (
-            img && img.base64 ? { ...img, base64: null, _stripped: true } : img
-          )),
-        };
+        if (!intake) return intake;
+        let out = intake;
+        // `extracted` is the AI's raw output, kept beside the editable `fields`
+        // copy. It is only read while reviewing a PENDING intake (confidence
+        // marks, unresolved notes). Once approved or rejected it is a pure
+        // duplicate — ~345 KB across the history, re-uploaded on every save.
+        if (out.status !== "pending" && out.extracted !== undefined) {
+          const { extracted, ...rest } = out; // eslint-disable-line no-unused-vars
+          out = rest;
+        }
+        if (Array.isArray(out.images) && out.images.some(img => img && img.base64)) {
+          out = {
+            ...out,
+            images: out.images.map(img => (
+              img && img.base64 ? { ...img, base64: null, _stripped: true } : img
+            )),
+          };
+        }
+        return out;
       });
     }
     return slim;
@@ -372,7 +383,7 @@ const sb = {
 // ═══════════════════════════════════════════════════════════════════
 const ADMIN_EMAIL = "Mohamed.abdullah969@gmail.com";
 const ADMIN_WA = "201270935507";
-const BUILD_TAG = "v9 · lean save";  // shown under the logo so it is obvious which build is live
+const BUILD_TAG = "v10.1 · access";  // shown under the logo so it is obvious which build is live
 // LinkedIn brand blue — used so its alerts stand apart from the amber/red ones.
 const LI_BLUE = "#0a66c2";
 // Any service whose name mentions LinkedIn counts, so "LinkedIn verification"
@@ -1120,6 +1131,9 @@ export default function App() {
 
   // ─── AUTH STATE ───
   const [authStatus, setAuthStatus] = useState("loading"); // loading | login | app
+  // Signed in, but neither the admin nor on the team. Such an account used to
+  // get the whole workspace with admin rights (isAdmin was simply "not a member").
+  const [accessDenied, setAccessDenied] = useState(false);
   const [authEmail, setAuthEmail] = useState("");
   const [authPassword, setAuthPassword] = useState("");
   const [authError, setAuthError] = useState("");
@@ -1338,7 +1352,9 @@ export default function App() {
     if (emailLower === ADMIN_EMAIL.toLowerCase()) return null;
     return team.find(m => (m.email || "").toLowerCase() === emailLower) || null;
   }, [currentUser, team]);
-  const isAdmin = !memberProfile;
+  // Admin is the admin EMAIL, not "anyone who isn't on the team".
+  const isAdmin = !memberProfile && !!currentUser
+    && (currentUser.email || "").toLowerCase() === ADMIN_EMAIL.toLowerCase();
   const memberId = memberProfile ? memberProfile.id : null;
   const memberPerms = memberProfile ? (memberProfile.permissions || DEFAULT_MEMBER_PERMS) : null;
   const memberActions = memberProfile ? (memberProfile.actions || DEFAULT_MEMBER_ACTIONS) : null;
@@ -1419,6 +1435,15 @@ export default function App() {
 
   const loadWorkspace = async (user) => {
     setLoaded(false);
+    setAccessDenied(false);
+    const userEmailLower = (user.email || "").toLowerCase();
+    // A non-admin may only open the workspace if their email is on its team.
+    const notOnTeam = (d) => !!d && !(Array.isArray(d.team)
+      && d.team.some(m => (m.email || "").toLowerCase() === userEmailLower));
+    const deny = () => {
+      console.warn("[ProSkill] ⛔ " + userEmailLower + " is not on the team — no access.");
+      setAccessDenied(true);
+    };
     try {
       // Admin: use their own id as the workspace owner
       if ((user.email || "").toLowerCase() === ADMIN_EMAIL.toLowerCase()) {
@@ -1458,6 +1483,7 @@ export default function App() {
           restoredFromBackupRef.current = true;
           console.warn("[ProSkill] ⚠️ Showing the shared copy — main workspace unreadable. Saving is paused.");
         }
+        if (notOnTeam(d)) { deny(); return; }
         if (!d) {
           try {
             const backup = localStorage.getItem("ps_backup_" + byEmail.ownerId);
@@ -1479,6 +1505,7 @@ export default function App() {
       if (adminId) {
         setWorkspaceOwnerId(adminId);
         let d = await loadWithRetry(() => sb.loadData(adminId), "legacy workspace");
+        if (notOnTeam(d)) { deny(); return; }
         if (!d) {
           try {
             const backup = localStorage.getItem("ps_backup_" + adminId);
@@ -1495,9 +1522,10 @@ export default function App() {
         setLoaded(true);
         return;
       }
-      // Fallback: try their own workspace (empty)
-      setWorkspaceOwnerId(user.id);
-      setLoaded(true);
+      // Fallback used to open an empty workspace of their own. Only non-admins
+      // reach here, and one who matches no workspace has no business in the app.
+      deny();
+      return;
     } catch (e) {
       console.error("[ProSkill] load threw:", e);
       setLoaded(true);
@@ -1767,6 +1795,7 @@ export default function App() {
   };
 
   const handleSignOut = async () => {
+    setAccessDenied(false);
     await sb.signOut();
     setCurrentUser(null);
     setWorkspaceOwnerId(null);
@@ -4521,6 +4550,24 @@ export default function App() {
   // Auth-based screens (rendered after all hooks are called)
   if (authStatus === "loading") return renderLoading();
   if (authStatus === "login") return renderLogin();
+  if (accessDenied) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
+                    background: "#0f172a", color: "#e2e8f0", fontFamily: "system-ui, sans-serif", padding: 24 }}>
+        <div style={{ maxWidth: 380, textAlign: "center" }}>
+          <div style={{ fontSize: 40, marginBottom: 12 }}>🔒</div>
+          <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>No access</div>
+          <div style={{ fontSize: 14, color: "#94a3b8", marginBottom: 20 }}>
+            {(currentUser && currentUser.email) || "This account"} is not on the team.
+            Ask the admin to add you, then sign in again.
+          </div>
+          <button onClick={handleSignOut}
+            style={{ padding: "10px 20px", borderRadius: 8, border: "none", background: "#2f7d78",
+                     color: "#fff", fontWeight: 700, cursor: "pointer" }}>Log out</button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={{
